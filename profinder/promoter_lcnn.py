@@ -37,11 +37,17 @@ class PromoterType(Enum):
 _ENCODING = {"A": [1, 0, 0, 0], "T": [0, 1, 0, 0],
              "C": [0, 0, 1, 0], "G": [0, 0, 0, 1]}
 
+_ZERO_VEC = [0, 0, 0, 0]  # ambiguous bases (N, R, Y, etc.)
+
 _SEQ_LEN = 81
 
 
 def _encode_sequences(seqs: List[str]) -> np.ndarray:
-    """One-hot encode a list of 81-nt DNA strings -> (N, 81, 4) array."""
+    """One-hot encode a list of 81-nt DNA strings -> (N, 81, 4) array.
+
+    Ambiguous bases (N, R, Y, W, etc.) are encoded as the zero vector
+    [0, 0, 0, 0] rather than raising an error.
+    """
     encoded = []
     for i, seq in enumerate(seqs):
         upper = seq.upper()
@@ -50,7 +56,7 @@ def _encode_sequences(seqs: List[str]) -> np.ndarray:
                 f"Sequence {i} has length {len(upper)} nt; "
                 f"expected exactly {_SEQ_LEN} nt."
             )
-        encoded.append([_ENCODING[nt] for nt in upper])
+        encoded.append([_ENCODING.get(nt, _ZERO_VEC) for nt in upper])
     return np.array(encoded, dtype=np.float32)
 
 
