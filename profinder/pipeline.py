@@ -665,19 +665,31 @@ def step10_annotate_cds(cfg: Config, force: bool = False):
 
     cfg.blast_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect all unique CDS gene IDs associated with promoters.
-    # For CO_F the associated CDS is right_gene; for CO_R it's left_gene.
-    promoter_files = [cfg.promoter_markers, cfg.igr_summary]
+    # Collect CDS gene IDs only from the promoters that made it into
+    # the output FASTAs (marker-filtered from step 8, or all-promoters
+    # from step 9).  We read the corresponding TSV sources and apply the
+    # same orientation filter (CO_F / CO_R only, no DP/CONV).
     gene_ids = set()
-    for pf in promoter_files:
-        if pf.exists():
-            try:
-                df = pd.read_csv(pf, sep="\t")
-                if "right_gene" in df.columns:
-                    gene_ids.update(df.loc[df["orientation"] == "CO_F", "right_gene"].dropna())
-                    gene_ids.update(df.loc[df["orientation"] == "CO_R", "left_gene"].dropna())
-            except (pd.errors.EmptyDataError, KeyError):
-                pass
+
+    # Prefer marker-filtered promoters (step 8 source)
+    if cfg.promoter_markers.exists():
+        try:
+            df = pd.read_csv(cfg.promoter_markers, sep="\t")
+            df = df[df["orientation"].isin(["CO_F", "CO_R"])]
+            gene_ids.update(df.loc[df["orientation"] == "CO_F", "right_gene"].dropna())
+            gene_ids.update(df.loc[df["orientation"] == "CO_R", "left_gene"].dropna())
+        except (pd.errors.EmptyDataError, KeyError):
+            pass
+
+    # Also include all-promoter IGRs (step 9 source) — same filter
+    if cfg.igr_summary.exists():
+        try:
+            df = pd.read_csv(cfg.igr_summary, sep="\t")
+            df = df[df["orientation"].isin(["CO_F", "CO_R"])]
+            gene_ids.update(df.loc[df["orientation"] == "CO_F", "right_gene"].dropna())
+            gene_ids.update(df.loc[df["orientation"] == "CO_R", "left_gene"].dropna())
+        except (pd.errors.EmptyDataError, KeyError):
+            pass
 
     if not gene_ids:
         print("── No promoter-associated CDS to annotate ──")
