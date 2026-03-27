@@ -665,26 +665,14 @@ def step10_annotate_cds(cfg: Config, force: bool = False):
 
     cfg.blast_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect CDS gene IDs only from the promoters that made it into
-    # the output FASTAs (marker-filtered from step 8, or all-promoters
-    # from step 9).  We read the corresponding TSV sources and apply the
-    # same orientation filter (CO_F / CO_R only, no DP/CONV).
+    # Collect CDS gene IDs only from the marker-filtered promoters
+    # (step 8 output).  For CO_F the associated CDS is right_gene;
+    # for CO_R it's left_gene.
     gene_ids = set()
 
-    # Prefer marker-filtered promoters (step 8 source)
     if cfg.promoter_markers.exists():
         try:
             df = pd.read_csv(cfg.promoter_markers, sep="\t")
-            df = df[df["orientation"].isin(["CO_F", "CO_R"])]
-            gene_ids.update(df.loc[df["orientation"] == "CO_F", "right_gene"].dropna())
-            gene_ids.update(df.loc[df["orientation"] == "CO_R", "left_gene"].dropna())
-        except (pd.errors.EmptyDataError, KeyError):
-            pass
-
-    # Also include all-promoter IGRs (step 9 source) — same filter
-    if cfg.igr_summary.exists():
-        try:
-            df = pd.read_csv(cfg.igr_summary, sep="\t")
             df = df[df["orientation"].isin(["CO_F", "CO_R"])]
             gene_ids.update(df.loc[df["orientation"] == "CO_F", "right_gene"].dropna())
             gene_ids.update(df.loc[df["orientation"] == "CO_R", "left_gene"].dropna())
@@ -932,25 +920,30 @@ def step12_generate_report(cfg: Config, force: bool = False):
 
     print("── Generating HTML report ──")
 
-    # Load promoter data (prefer all_promoters for completeness)
+    # Load marker-filtered promoters (step 7 output)
     promoter_df = None
-    for candidate in [cfg.all_promoter_fasta]:
-        igr_path = cfg.igr_summary
-        if igr_path.exists():
-            try:
-                df = pd.read_csv(igr_path, sep="\t")
-                # Filter to promoter orientations only
-                df = df[df["orientation"].isin(["CO_F", "CO_R"])].copy()
-                if not df.empty:
-                    promoter_df = df
-                    break
-            except pd.errors.EmptyDataError:
-                pass
+    if cfg.promoter_markers.exists():
+        try:
+            df = pd.read_csv(cfg.promoter_markers, sep="\t")
+            df = df[df["orientation"].isin(["CO_F", "CO_R"])].copy()
+            if not df.empty:
+                promoter_df = df
+        except pd.errors.EmptyDataError:
+            pass
 
     if promoter_df is None or promoter_df.empty:
-        print("  No promoter data available for report.")
+        print("  No marker-filtered promoter data available for report.")
         print("  Step 12 complete.\n")
         return
+
+    # Count all promoter-orientation IGRs for reference
+    n_all_promoters = 0
+    if cfg.igr_summary.exists():
+        try:
+            all_igr = pd.read_csv(cfg.igr_summary, sep="\t")
+            n_all_promoters = len(all_igr[all_igr["orientation"].isin(["CO_F", "CO_R"])])
+        except pd.errors.EmptyDataError:
+            pass
 
     # Add associated gene column
     promoter_df["associated_gene"] = promoter_df.apply(_get_associated_gene, axis=1)
@@ -1015,6 +1008,11 @@ def step12_generate_report(cfg: Config, force: bool = False):
         except (pd.errors.EmptyDataError, KeyError):
             pass
 
+    # Filter FIMO hits to only marker-filtered promoter IDs
+    marker_igr_ids = set(promoter_df["igr_id"])
+    fimo_by_promoter = {k: v for k, v in fimo_by_promoter.items()
+                        if k in marker_igr_ids}
+
     # Build HTML
     n_promoters = len(promoter_df)
     n_annotated = sum(1 for _, r in promoter_df.iterrows()
@@ -1024,12 +1022,17 @@ def step12_generate_report(cfg: Config, force: bool = False):
 
     genome_name = cfg.input_fasta.stem
 
+    # Paths for the all-promoters FASTA link (relative to output dir)
+    all_promo_name = cfg.all_promoter_fasta.name if cfg.all_promoter_fasta.exists() else ""
+
     html_parts = [_REPORT_HTML_HEAD.format(
         genome_name=html_mod.escape(genome_name),
-        n_promoters=n_promoters,
+        n_marker_promoters=n_promoters,
+        n_all_promoters=n_all_promoters,
         n_annotated=n_annotated,
         n_with_motifs=n_with_motifs,
         total_fimo=sum(len(v) for v in fimo_by_promoter.values()),
+        all_promoters_fasta=html_mod.escape(all_promo_name),
     )]
 
     # Legend
@@ -1212,13 +1215,20 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 <p style="color:#666; margin-bottom:4px;">Genome: <strong>{genome_name}</strong></p>
 
 <div class="summary">
-    <div class="stat"><div class="label">Promoters</div><div class="value">{n_promoters}</div></div>
+    <div class="stat"><div class="label">Marker promoters</div><div class="value">{n_marker_promoters}</div></div>
     <div class="stat"><div class="label">CDS annotated</div><div class="value">{n_annotated}</div></div>
     <div class="stat"><div class="label">With motif hits</div><div class="value">{n_with_motifs}</div></div>
     <div class="stat"><div class="label">Total motif hits</div><div class="value">{total_fimo}</div></div>
+    <div class="stat"><div class="label">All promoter IGRs</div><div class="value">{n_all_promoters}</div></div>
 </div>
 
-<h2>Promoter summary</h2>
+<p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
+    This report shows the <strong>{n_marker_promoters}</strong> marker-filtered promoters.
+    A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome
+    (<a href="{all_promoters_fasta}">all_promoters.fasta</a>).
+</p>
+
+<h2>Marker-filtered promoters</h2>
 """
 
 _REPORT_HTML_FOOT = """
