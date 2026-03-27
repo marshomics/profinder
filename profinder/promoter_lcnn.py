@@ -61,7 +61,12 @@ def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
     Lazy-imports TensorFlow so that modules that don't call this function
     never pay the import cost.
     """
+    import os
+    # Suppress TensorFlow informational/warning logs (GPU probing, TensorRT,
+    # oneDNN notices) that clutter pipeline output on CPU-only machines.
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
     import tensorflow as tf  # noqa: delayed import
+    tf.get_logger().setLevel("ERROR")
     # compile=False skips optimizer restoration — we only need forward passes,
     # and the original models were trained with tensorflow-addons' LazyAdam
     # which may not be installed at inference time.
