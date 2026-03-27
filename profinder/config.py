@@ -18,11 +18,9 @@ class Config:
     # ── Tool paths ───────────────────────────────────────────────────
     prokka_bin: str = "prokka"
     hmmsearch_bin: str = "hmmsearch"
-    blastp_bin: str = "blastp"
     fimo_bin: str = "fimo"
     conda_env_prokka: str = ""   # leave blank to skip conda activate
     conda_env_hmm: str = ""
-    conda_env_blast: str = ""
     conda_env_meme: str = ""
 
     # ── HMM databases (bundled by default) ──────────────────────────
@@ -30,14 +28,17 @@ class Config:
     pfam_hmm: Path = None
 
     def __post_init__(self):
-        """Resolve bundled HMM paths if none were provided."""
+        """Resolve bundled HMM and weight paths if none were provided."""
         bundled_hmms = Path(__file__).parent / "hmms"
         if self.tigrfam_hmm is None:
             candidate = bundled_hmms / "tigrfam.hmm"
-            self.tigrfam_hmm = candidate if candidate.exists() else Path("")
+            self.tigrfam_hmm = candidate if candidate.exists() else None
         if self.pfam_hmm is None:
             candidate = bundled_hmms / "Pfam-A.hmm"
-            self.pfam_hmm = candidate if candidate.exists() else Path("")
+            self.pfam_hmm = candidate if candidate.exists() else None
+        if self.lcnn_weights_dir is None:
+            candidate = Path(__file__).parent / "weights" / "PromoterLCNN"
+            self.lcnn_weights_dir = candidate if candidate.is_dir() else None
 
     # ── Parallelism ──────────────────────────────────────────────────
     threads: int = 4
@@ -58,12 +59,8 @@ class Config:
     # ── HMM filtering ────────────────────────────────────────────────
     hmm_bitscore_min: float = 25.0
 
-    # ── BLAST parameters ─────────────────────────────────────────────
-    blast_db: str = "swissprot"      # NCBI remote database name
-    blast_evalue: float = 1e-5
-    blast_max_targets: int = 1       # keep best hit per query
-    blast_remote: bool = True        # use -remote (no local DB needed)
-    blast_local_db: Path = None       # if set, use local DB instead
+    # ── PromoterLCNN parameters ────────────────────────────────────────
+    lcnn_weights_dir: Path = None     # parent dir containing IsPromoter_fold_5/ and PromotersOnly_fold_1/
 
     # ── FIMO parameters ──────────────────────────────────────────────
     motifs_dir: Path = None           # directory containing .meme files
@@ -142,18 +139,14 @@ class Config:
     def all_promoter_fasta_short(self) -> Path:
         return self.output_dir / "all_promoters_short.fasta"
 
-    # ── BLAST output ──────────────────────────────────────────────────
+    # ── PromoterLCNN output ────────────────────────────────────────────
     @property
-    def blast_dir(self) -> Path:
-        return self.output_dir / "blast"
+    def lcnn_predictions(self) -> Path:
+        return self.output_dir / "lcnn_predictions.tsv"
 
     @property
-    def blast_raw(self) -> Path:
-        return self.blast_dir / "blastp_results.tsv"
-
-    @property
-    def blast_annotated(self) -> Path:
-        return self.blast_dir / "cds_annotations.tsv"
+    def promoter_markers_verified(self) -> Path:
+        return self.output_dir / "promoter_markers_verified.tsv"
 
     # ── FIMO output ───────────────────────────────────────────────────
     @property
@@ -172,5 +165,5 @@ class Config:
     def ensure_dirs(self):
         """Create all output directories."""
         for d in [self.output_dir, self.prokka_dir, self.igr_dir,
-                  self.hmm_dir, self.blast_dir, self.fimo_dir]:
+                  self.hmm_dir, self.fimo_dir]:
             d.mkdir(parents=True, exist_ok=True)
