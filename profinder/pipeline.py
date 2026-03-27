@@ -39,9 +39,10 @@ Steps
     8.  Extract promoter sequences (marker-filtered)
     9.  Extract all promoter sequences (orientation-based, no HMM filter)
     10. Predict promoters with PromoterLCNN (final filter)
-    11. Annotate associated CDS (Prokka product names)
+    11. Annotate associated CDS (Prokka product names, gene, locus tag)
     12. Scan promoters for motifs (FIMO)
-    13. Generate HTML report
+    13. Build final output table (all promoters, all metadata)
+    14. Generate HTML report
 """
 
 import argparse
@@ -587,15 +588,16 @@ def step09_extract_all_promoters(cfg: Config, force: bool = False):
 # =====================================================================
 
 def step10_predict_promoters(cfg: Config, force: bool = False):
-    """Run PromoterLCNN on marker-filtered promoters.
+    """Run PromoterLCNN on ALL promoter-orientation IGRs.
 
-    Each promoter sequence is trimmed to its 3'-terminal 81 nt (closest
-    to the transcription start site) before prediction.  The step writes
-    per-sequence predictions to ``lcnn_predictions.tsv`` and a filtered
-    version of ``promoter_markers.tsv`` (only rows classified as
-    promoters) to ``promoter_markers_verified.tsv``.
+    Each sequence is trimmed to its 3'-terminal 81 nt (closest to the
+    transcription start site) before prediction.  The step writes:
 
-    Sequences shorter than 81 nt are classified as NON_PROMOTER.
+    * ``lcnn_predictions.tsv`` — per-sequence predictions for every
+      promoter-orientation IGR.
+    * ``promoter_markers_verified.tsv`` — subset of marker promoters
+      that PromoterLCNN also classifies as promoters (used by the HTML
+      report and downstream annotation steps).
     """
     if not force and cfg.lcnn_predictions.exists() and cfg.promoter_markers_verified.exists():
         print("── PromoterLCNN predictions already exist, skipping ──")
@@ -606,35 +608,35 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
     if cfg.lcnn_weights_dir is None or not cfg.lcnn_weights_dir.is_dir():
         print("── PromoterLCNN weights not available, skipping prediction ──")
         print("  Provide --lcnn-weights or reinstall to restore bundled weights.")
-        # Pass-through: copy promoter_markers as-is
+        # Write empty predictions; pass-through markers as-is
+        if cfg.igr_summary.exists():
+            pd.DataFrame(columns=["igr_id", "prediction", "sigma_type"]).to_csv(
+                cfg.lcnn_predictions, sep="\t", index=False)
         if cfg.promoter_markers.exists():
             import shutil
             shutil.copy2(cfg.promoter_markers, cfg.promoter_markers_verified)
         print("  Step 10 complete.\n")
         return
 
-    # Load marker-filtered promoters
+    # Load ALL promoter-orientation IGRs
     try:
-        markers_df = pd.read_csv(cfg.promoter_markers, sep="\t")
-        markers_df = markers_df[markers_df["orientation"].isin(["CO_F", "CO_R"])].copy()
+        all_igr = pd.read_csv(cfg.igr_summary, sep="\t")
+        all_igr = all_igr[all_igr["orientation"].isin(["CO_F", "CO_R"])].copy()
     except (FileNotFoundError, pd.errors.EmptyDataError):
-        markers_df = pd.DataFrame()
+        all_igr = pd.DataFrame()
 
-    if markers_df.empty:
-        print("── No marker promoters to classify ──")
+    if all_igr.empty:
+        print("── No promoter-orientation IGRs to classify ──")
         pd.DataFrame(columns=["igr_id", "prediction", "sigma_type"]).to_csv(
             cfg.lcnn_predictions, sep="\t", index=False)
-        markers_df.to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
+        pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
         print("  Step 10 complete.\n")
         return
 
     # Orient sequences 5'→3'
-    from Bio.Seq import Seq as _Seq
-    def _rc(s):
-        return str(_Seq(s).reverse_complement())
-
-    markers_df["sequence_5p_to_3p"] = markers_df.apply(
-        lambda r: _rc(r["sequence"]) if r["orientation"] == "CO_R" else r["sequence"],
+    all_igr["sequence_5p_to_3p"] = all_igr.apply(
+        lambda r: _reverse_complement(r["sequence"]) if r["orientation"] == "CO_R"
+        else r["sequence"],
         axis=1,
     )
 
@@ -642,7 +644,7 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
     _LCNN_LEN = 81
     seqs_81 = []
     short_mask = []
-    for seq in markers_df["sequence_5p_to_3p"]:
+    for seq in all_igr["sequence_5p_to_3p"]:
         if len(seq) >= _LCNN_LEN:
             seqs_81.append(seq[-_LCNN_LEN:])
             short_mask.append(False)
@@ -658,7 +660,8 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
     # Load models and predict
     from .promoter_lcnn import load_models, predict as lcnn_predict, PromoterType
 
-    print(f"── Running PromoterLCNN on {len(seqs_81) - n_short} sequences ──")
+    n_valid = len(seqs_81) - n_short
+    print(f"── Running PromoterLCNN on {n_valid} sequences ──")
     models = load_models(
         cfg.lcnn_weights_dir / "IsPromoter_fold_5",
         cfg.lcnn_weights_dir / "PromotersOnly_fold_1",
@@ -679,9 +682,9 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
         else:
             full_preds.append(next(pred_iter))
 
-    # Build predictions table
+    # Build predictions table for ALL promoter-orientation IGRs
     pred_rows = []
-    for i, (_, row) in enumerate(markers_df.iterrows()):
+    for i, (_, row) in enumerate(all_igr.iterrows()):
         pt = full_preds[i]
         pred_rows.append({
             "igr_id": row["igr_id"],
@@ -697,18 +700,25 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
     print(f"  Predicted: {n_promoter} promoter(s), {n_non} non-promoter(s)")
     print(f"  Predictions -> {cfg.lcnn_predictions}")
 
-    # Write verified markers (only those predicted as promoters)
-    promoter_igr_ids = set(
-        pred_rows[i]["igr_id"]
-        for i, p in enumerate(full_preds)
-        if p != PromoterType.NON_PROMOTER
-    )
-    verified_df = markers_df[markers_df["igr_id"].isin(promoter_igr_ids)].copy()
-    # Add sigma type column
+    # Write verified markers: intersection of marker promoters and LCNN-positive
+    marker_igr_ids = set()
+    try:
+        markers_df = pd.read_csv(cfg.promoter_markers, sep="\t")
+        markers_df = markers_df[markers_df["orientation"].isin(["CO_F", "CO_R"])]
+        marker_igr_ids = set(markers_df["igr_id"])
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        pass
+
+    lcnn_positive = set(r["igr_id"] for r in pred_rows if r["prediction"] == "PROMOTER")
+    verified_ids = marker_igr_ids & lcnn_positive
+
     sigma_map = {r["igr_id"]: r["sigma_type"] for r in pred_rows}
-    verified_df["sigma_type"] = verified_df["igr_id"].map(sigma_map)
-    # Drop the temporary 5'→3' column
-    verified_df.drop(columns=["sequence_5p_to_3p"], inplace=True, errors="ignore")
+
+    if marker_igr_ids:
+        verified_df = markers_df[markers_df["igr_id"].isin(verified_ids)].copy()
+        verified_df["sigma_type"] = verified_df["igr_id"].map(sigma_map)
+    else:
+        verified_df = pd.DataFrame()
 
     verified_df.to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
     print(f"  Verified markers ({len(verified_df)} rows) -> {cfg.promoter_markers_verified}")
@@ -719,12 +729,23 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
 #  Step 11 — Annotate associated CDS from Prokka
 # =====================================================================
 
-def _parse_prokka_product(gff_path, gene_ids):
-    """Extract product annotations from the Prokka GFF for a set of gene IDs.
+def _parse_prokka_gff_annotations(gff_path, gene_ids=None):
+    """Extract CDS annotations from a Prokka GFF.
 
-    Returns a dict mapping gene_id -> product name.
+    Parameters
+    ----------
+    gff_path : Path
+        Prokka GFF3 file.
+    gene_ids : set or None
+        If provided, only return entries whose ID is in this set.
+        If None, return all CDS entries.
+
+    Returns
+    -------
+    dict
+        Mapping gene_id -> {"product": str, "gene": str, "locus_tag": str}.
     """
-    product_map = {}
+    annotations = {}
     with open(str(gff_path)) as fh:
         for line in fh:
             if line.startswith("##FASTA"):
@@ -737,32 +758,41 @@ def _parse_prokka_product(gff_path, gene_ids):
             attrs = cols[8]
             gene_id = ""
             product = "hypothetical protein"
+            gene_name = ""
+            locus_tag = ""
             for attr in attrs.split(";"):
                 if attr.startswith("ID="):
                     gene_id = attr[3:]
                 elif attr.startswith("product="):
                     product = attr[8:]
-            if gene_id in gene_ids:
-                product_map[gene_id] = product
-    return product_map
+                elif attr.startswith("gene="):
+                    gene_name = attr[5:]
+                elif attr.startswith("locus_tag="):
+                    locus_tag = attr[10:]
+            if gene_ids is None or gene_id in gene_ids:
+                annotations[gene_id] = {
+                    "product": product,
+                    "gene": gene_name,
+                    "locus_tag": locus_tag,
+                }
+    return annotations
 
 
 def step11_annotate_cds(cfg: Config, force: bool = False):
-    """Extract CDS product annotations from Prokka GFF for the
-    marker-filtered promoters."""
+    """Extract CDS annotations (product, gene name, locus tag) from Prokka
+    GFF for ALL promoter-orientation IGRs."""
     annotation_tsv = cfg.output_dir / "cds_annotations.tsv"
     if not force and annotation_tsv.exists():
         print("── CDS annotations already exist, skipping ──")
         print("  Step 11 complete.\n")
         return
 
-    # Collect CDS gene IDs from verified promoters (after PromoterLCNN filter).
+    # Collect CDS gene IDs from ALL promoter-orientation IGRs.
     # For CO_F the associated CDS is right_gene; for CO_R it's left_gene.
     gene_ids = set()
-    verified = cfg.promoter_markers_verified
-    if verified.exists():
+    if cfg.igr_summary.exists():
         try:
-            df = pd.read_csv(verified, sep="\t")
+            df = pd.read_csv(cfg.igr_summary, sep="\t")
             df = df[df["orientation"].isin(["CO_F", "CO_R"])]
             gene_ids.update(df.loc[df["orientation"] == "CO_F", "right_gene"].dropna())
             gene_ids.update(df.loc[df["orientation"] == "CO_R", "left_gene"].dropna())
@@ -771,16 +801,23 @@ def step11_annotate_cds(cfg: Config, force: bool = False):
 
     if not gene_ids:
         print("── No promoter-associated CDS to annotate ──")
-        pd.DataFrame(columns=["gene_id", "product"]).to_csv(
+        pd.DataFrame(columns=["gene_id", "product", "gene", "locus_tag"]).to_csv(
             annotation_tsv, sep="\t", index=False)
         print("  Step 11 complete.\n")
         return
 
     print(f"── Annotating {len(gene_ids)} CDS from Prokka GFF ──")
-    product_map = _parse_prokka_product(cfg.gff_file, gene_ids)
+    ann_map = _parse_prokka_gff_annotations(cfg.gff_file, gene_ids)
 
-    rows = [{"gene_id": gid, "product": product_map.get(gid, "hypothetical protein")}
-            for gid in sorted(gene_ids)]
+    rows = []
+    for gid in sorted(gene_ids):
+        info = ann_map.get(gid, {})
+        rows.append({
+            "gene_id": gid,
+            "product": info.get("product", "hypothetical protein"),
+            "gene": info.get("gene", ""),
+            "locus_tag": info.get("locus_tag", ""),
+        })
     result_df = pd.DataFrame(rows)
     result_df.to_csv(annotation_tsv, sep="\t", index=False)
     print(f"  Annotated {len(result_df)} CDS -> {annotation_tsv}")
@@ -884,7 +921,7 @@ def step12_run_fimo(cfg: Config, force: bool = False):
 
 
 # =====================================================================
-#  Step 13 — HTML report
+#  Step 14 — HTML report
 # =====================================================================
 
 def _get_associated_gene(row):
@@ -954,12 +991,12 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50):
     return "\n".join(parts)
 
 
-def step13_generate_report(cfg: Config, force: bool = False):
+def step14_generate_report(cfg: Config, force: bool = False):
     """Generate an HTML report combining promoters, CDS annotations,
     and motif hits with visual sequence diagrams."""
     if not force and cfg.report_html.exists():
         print("── HTML report already exists, skipping ──")
-        print("  Step 13 complete.\n")
+        print("  Step 14 complete.\n")
         return
 
     print("── Generating HTML report ──")
@@ -979,7 +1016,15 @@ def step13_generate_report(cfg: Config, force: bool = False):
 
     if promoter_df is None or promoter_df.empty:
         print("  No verified promoter data available for report.")
-        print("  Step 13 complete.\n")
+        print("  Step 14 complete.\n")
+        return
+
+    # Filter to σ70 promoters only
+    if "sigma_type" in promoter_df.columns:
+        promoter_df = promoter_df[promoter_df["sigma_type"] == "SIGMA_70"].copy()
+    if promoter_df.empty:
+        print("  No σ70 promoters found for report.")
+        print("  Step 14 complete.\n")
         return
 
     # Count all promoter-orientation IGRs for reference
@@ -1068,6 +1113,7 @@ def step13_generate_report(cfg: Config, force: bool = False):
     all_promo_name = cfg.all_promoter_fasta.name if cfg.all_promoter_fasta.exists() else ""
     verified_tsv_name = cfg.promoter_markers_verified.name if cfg.promoter_markers_verified.exists() else ""
     promoters_fasta_name = cfg.promoter_fasta.name if cfg.promoter_fasta.exists() else ""
+    final_table_name = cfg.final_table.name if cfg.final_table.exists() else ""
 
     html_parts = [_REPORT_HTML_HEAD.format(
         genome_name=html_mod.escape(genome_name),
@@ -1079,6 +1125,7 @@ def step13_generate_report(cfg: Config, force: bool = False):
         all_promoters_fasta=html_mod.escape(all_promo_name),
         verified_tsv=html_mod.escape(verified_tsv_name),
         promoters_fasta=html_mod.escape(promoters_fasta_name),
+        final_table=html_mod.escape(final_table_name),
     )]
 
     # Legend
@@ -1144,49 +1191,12 @@ def step13_generate_report(cfg: Config, force: bool = False):
 
     html_parts.append("</tbody></table>")
 
-    # Motif detail section
-    if fimo_by_promoter:
-        html_parts.append("<h2>Motif hit details</h2>")
-        html_parts.append("""
-        <table class="motif-detail">
-        <thead>
-        <tr>
-            <th>Promoter</th>
-            <th>Motif ID</th>
-            <th>Motif name</th>
-            <th>Database</th>
-            <th>Position</th>
-            <th>Strand</th>
-            <th>p-value</th>
-            <th>Matched sequence</th>
-        </tr>
-        </thead>
-        <tbody>
-        """)
-        for igr_id, hits in sorted(fimo_by_promoter.items()):
-            for hit in sorted(hits, key=lambda h: h["start"]):
-                pval = hit["p-value"]
-                pval_str = f"{pval:.2e}" if isinstance(pval, float) else str(pval)
-                html_parts.append(f"""
-                <tr>
-                    <td><code>{html_mod.escape(igr_id)}</code></td>
-                    <td>{html_mod.escape(hit['motif_id'])}</td>
-                    <td>{html_mod.escape(hit.get('motif_alt_id', ''))}</td>
-                    <td>{html_mod.escape(hit['motif_database'])}</td>
-                    <td>{hit['start']}–{hit['stop']}</td>
-                    <td>{hit['strand']}</td>
-                    <td>{pval_str}</td>
-                    <td><code>{html_mod.escape(hit.get('matched_sequence', ''))}</code></td>
-                </tr>
-                """)
-        html_parts.append("</tbody></table>")
-
     html_parts.append(_REPORT_HTML_FOOT)
 
     with open(cfg.report_html, "w") as fh:
         fh.write("\n".join(html_parts))
     print(f"  Report -> {cfg.report_html}")
-    print("  Step 13 complete.\n")
+    print("  Step 14 complete.\n")
 
 
 # ── HTML template fragments ──────────────────────────────────────────
@@ -1258,7 +1268,7 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 <p style="color:#666; margin-bottom:4px;">Genome: <strong>{genome_name}</strong></p>
 
 <div class="summary">
-    <div class="stat"><div class="label">Verified promoters</div><div class="value">{n_marker_promoters}</div></div>
+    <div class="stat"><div class="label">&sigma;70 promoters</div><div class="value">{n_marker_promoters}</div></div>
     <div class="stat"><div class="label">CDS annotated</div><div class="value">{n_annotated}</div></div>
     <div class="stat"><div class="label">With motif hits</div><div class="value">{n_with_motifs}</div></div>
     <div class="stat"><div class="label">Total motif hits</div><div class="value">{total_fimo}</div></div>
@@ -1266,17 +1276,18 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 </div>
 
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
-    This report shows the <strong>{n_marker_promoters}</strong> verified promoters (marker-filtered, CNN-confirmed).
+    This report shows the <strong>{n_marker_promoters}</strong> &sigma;70 promoters (marker-filtered, CNN-confirmed, &sigma;70 only).
     A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome.
 </p>
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
     <strong>Downloads:</strong>
     <a href="{promoters_fasta}">promoters.fasta</a> ·
     <a href="{verified_tsv}">promoter_markers_verified.tsv</a> ·
-    <a href="{all_promoters_fasta}">all_promoters.fasta</a>
+    <a href="{all_promoters_fasta}">all_promoters.fasta</a> ·
+    <a href="{final_table}">profinder_results.tsv</a>
 </p>
 
-<h2>Verified promoters</h2>
+<h2>&sigma;70 promoters</h2>
 """
 
 _REPORT_HTML_FOOT = """
@@ -1286,6 +1297,155 @@ _REPORT_HTML_FOOT = """
 </body>
 </html>
 """
+
+# =====================================================================
+#  Step 13 — Final output table
+# =====================================================================
+
+def step13_final_table(cfg: Config, force: bool = False):
+    """Build a comprehensive TSV table covering ALL promoter-orientation
+    IGRs with every piece of metadata collected by the pipeline.
+
+    Columns
+    -------
+    promoter_id           IGR identifier (igr_NNNNNN)
+    contig                Source contig / scaffold
+    start                 IGR start coordinate (1-based)
+    end                   IGR end coordinate
+    length                IGR length in bp
+    orientation           CO_F or CO_R
+    associated_cds        Prokka gene ID of downstream CDS
+    gene_name             Gene name from Prokka GFF (gene= attribute)
+    locus_tag             Locus tag from Prokka GFF (locus_tag= attribute)
+    product               Protein product name from Prokka GFF
+    is_marker             Whether this IGR flanks a marker-operon gene
+    lcnn_prediction       PROMOTER or NON_PROMOTER
+    sigma_type            Sigma-factor subtype from PromoterLCNN
+    motif_hits            Semicolon-separated list of FIMO motif hits
+    sequence_5p_to_3p     Full promoter sequence oriented 5'→3'
+    """
+    if not force and cfg.final_table.exists():
+        print("── Final output table already exists, skipping ──")
+        print("  Step 13 complete.\n")
+        return
+
+    print("── Building final output table ──")
+
+    # 1. Start from ALL promoter-orientation IGRs
+    try:
+        igr = pd.read_csv(cfg.igr_summary, sep="\t")
+        igr = igr[igr["orientation"].isin(["CO_F", "CO_R"])].copy()
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        igr = pd.DataFrame()
+
+    if igr.empty:
+        print("  No promoter-orientation IGRs found.")
+        pd.DataFrame().to_csv(cfg.final_table, sep="\t", index=False)
+        print("  Step 13 complete.\n")
+        return
+
+    # 2. Associated CDS
+    igr["associated_cds"] = igr.apply(_get_associated_gene, axis=1)
+
+    # 3. Orient sequences 5'→3'
+    igr["sequence_5p_to_3p"] = igr.apply(
+        lambda r: _reverse_complement(r["sequence"]) if r["orientation"] == "CO_R"
+        else r["sequence"],
+        axis=1,
+    )
+
+    # 4. CDS annotations (gene name, locus tag, product)
+    annotation_tsv = cfg.output_dir / "cds_annotations.tsv"
+    ann_map = {}   # gene_id -> {product, gene, locus_tag}
+    if annotation_tsv.exists():
+        try:
+            ann_df = pd.read_csv(annotation_tsv, sep="\t")
+            for _, row in ann_df.iterrows():
+                ann_map[row["gene_id"]] = {
+                    "product": str(row.get("product", "")),
+                    "gene": str(row.get("gene", "")),
+                    "locus_tag": str(row.get("locus_tag", "")),
+                }
+        except (pd.errors.EmptyDataError, KeyError):
+            pass
+
+    igr["gene_name"] = igr["associated_cds"].map(
+        lambda g: ann_map.get(g, {}).get("gene", ""))
+    igr["locus_tag"] = igr["associated_cds"].map(
+        lambda g: ann_map.get(g, {}).get("locus_tag", ""))
+    igr["product"] = igr["associated_cds"].map(
+        lambda g: ann_map.get(g, {}).get("product", ""))
+
+    # 5. Marker status
+    marker_igr_ids = set()
+    if cfg.promoter_markers.exists():
+        try:
+            m_df = pd.read_csv(cfg.promoter_markers, sep="\t")
+            marker_igr_ids = set(m_df["igr_id"])
+        except (pd.errors.EmptyDataError, KeyError):
+            pass
+    igr["is_marker"] = igr["igr_id"].isin(marker_igr_ids)
+
+    # 6. PromoterLCNN predictions
+    lcnn_map = {}   # igr_id -> {prediction, sigma_type}
+    if cfg.lcnn_predictions.exists():
+        try:
+            lcnn_df = pd.read_csv(cfg.lcnn_predictions, sep="\t")
+            for _, row in lcnn_df.iterrows():
+                lcnn_map[row["igr_id"]] = {
+                    "prediction": str(row.get("prediction", "")),
+                    "sigma_type": str(row.get("sigma_type", "")),
+                }
+        except (pd.errors.EmptyDataError, KeyError):
+            pass
+
+    igr["lcnn_prediction"] = igr["igr_id"].map(
+        lambda g: lcnn_map.get(g, {}).get("prediction", ""))
+    igr["sigma_type"] = igr["igr_id"].map(
+        lambda g: lcnn_map.get(g, {}).get("sigma_type", ""))
+
+    # 7. FIMO motif hits (semicolon-separated summary per promoter)
+    fimo_summary = {}   # igr_id -> semicolon-separated motif names
+    if cfg.fimo_combined.exists():
+        try:
+            fimo_df = pd.read_csv(cfg.fimo_combined, sep="\t")
+            seq_col = "sequence_name"
+            if seq_col not in fimo_df.columns:
+                for alt in ["sequence name", "#pattern name"]:
+                    if alt in fimo_df.columns:
+                        seq_col = alt
+                        break
+            if seq_col in fimo_df.columns:
+                for seq_name, grp in fimo_df.groupby(seq_col):
+                    m = re.match(r"(igr_\d+)", seq_name)
+                    igr_id = m.group(1) if m else seq_name.split("_")[0] + "_" + seq_name.split("_")[1]
+                    names = []
+                    for _, hit in grp.iterrows():
+                        alt = str(hit.get("motif_alt_id", ""))
+                        mid = str(hit.get("motif_id", hit.get("#pattern name", "")))
+                        db = str(hit.get("motif_database", ""))
+                        pval = hit.get("p-value", "")
+                        label = alt if alt and alt != "nan" else mid
+                        names.append(f"{label}({db},p={pval})")
+                    fimo_summary[igr_id] = "; ".join(names)
+        except (pd.errors.EmptyDataError, KeyError):
+            pass
+
+    igr["motif_hits"] = igr["igr_id"].map(lambda g: fimo_summary.get(g, ""))
+
+    # 8. Select and order final columns
+    out = igr[[
+        "igr_id", "contig", "start", "end", "length", "orientation",
+        "associated_cds", "gene_name", "locus_tag", "product",
+        "is_marker", "lcnn_prediction", "sigma_type",
+        "motif_hits", "sequence_5p_to_3p",
+    ]].copy()
+    out.rename(columns={"igr_id": "promoter_id"}, inplace=True)
+
+    out.to_csv(cfg.final_table, sep="\t", index=False)
+    print(f"  Final table ({len(out)} rows) -> {cfg.final_table}")
+    print("  Step 13 complete.\n")
+
 
 STEPS = [
     (1,  "Run Prokka",                      step01_run_prokka),
@@ -1300,7 +1460,8 @@ STEPS = [
     (10, "Predict promoters (PromoterLCNN)", step10_predict_promoters),
     (11, "Annotate CDS (Prokka)",            step11_annotate_cds),
     (12, "Scan motifs (FIMO)",               step12_run_fimo),
-    (13, "Generate HTML report",             step13_generate_report),
+    (13, "Build final output table",         step13_final_table),
+    (14, "Generate HTML report",             step14_generate_report),
 ]
 
 
