@@ -149,7 +149,7 @@ Parameters:
   --threads N            Threads for external tools (default: 4)
   --kingdom STR          Prokka kingdom (default: Bacteria)
   --prefix STR           Prokka output prefix (default: genome)
-  --igr-min N            Minimum IGR length in bp (default: 75)
+  --igr-min N            Minimum IGR length in bp (default: 81)
   --igr-max N            Maximum IGR length in bp (default: 1000)
   --max-internal-dist N  Max gap within an operon in bp (default: 25)
   --min-flanking-dist N  Min gap at operon boundaries in bp (default: 75)
