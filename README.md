@@ -1,10 +1,22 @@
 # ProFinder
 
-Identify and extract bacterial promoter sequences from a single genome FASTA file, annotate their associated coding sequences, scan for known transcription factor binding motifs, and produce an HTML report.
+A bacterial promoter identification pipeline that extracts high-confidence constitutive (σ70) promoter candidates from any genome assembly. Given a FASTA file, ProFinder returns a curated shortlist of promoter sequences upstream of conserved housekeeping genes, ready for integration into genetic system development workflows.
 
-The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions (IGRs) between annotated genes, identifies operons using a two-pass proximity/flanking-distance algorithm, screens for marker genes via hmmsearch against TIGRfam and Pfam (HMM profiles are bundled), and outputs promoter sequences oriented 5'→3'. Candidate promoters are then verified with [PromoterLCNN](https://github.com/occasumlux/Promoters), a two-stage CNN that classifies each sequence as promoter or non-promoter and assigns a sigma-factor subtype (σ70, σ24, σ28, σ38, σ32, σ54). CDS functional annotations come from Prokka's gene product predictions. Promoters are scanned for known motifs with FIMO, and a visual HTML report is generated.
+## What ProFinder does
 
-All databases ship with the pipeline. No additional downloads are needed beyond installing the external tools.
+ProFinder is built for a specific use case: identifying constitutive promoters that are likely to drive reliable expression in a microbe of interest. It is not a genome-wide promoter annotation tool. Instead of returning thousands of candidate sites with varying confidence, ProFinder applies a series of biologically motivated filters to produce a short, high-confidence list of σ70 (constitutive) promoter sequences upstream of single-copy phylogenetic marker genes (ribosomal proteins, tRNA synthetases, DNA replication components, and other essential housekeeping functions). These marker genes are known to be expressed across growth conditions because the cell cannot afford to silence them, and their promoters are strong candidates for use in expression constructs, reporter systems, and metabolic engineering.
+
+The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions (IGRs) between annotated genes, identifies operons using a two-pass proximity/flanking-distance algorithm, and screens for marker genes via hmmsearch against TIGRfam and Pfam (HMM profiles are bundled). Candidate promoters are classified with [PromoterLCNN](https://github.com/occasumlux/Promoters), a two-stage CNN that distinguishes promoter from non-promoter sequences and assigns a sigma-factor subtype (σ70, σ24, σ28, σ38, σ32, σ54). Promoters are scanned for known transcription factor binding motifs with FIMO, and a visual HTML report is generated. All databases ship with the pipeline.
+
+## Why an *E. coli*-trained classifier works across species
+
+PromoterLCNN was trained on experimentally verified *E. coli* K-12 promoter sequences from RegulonDB. The *E. coli* σ70 promoter is one of the best-characterised regulatory elements in bacterial biology: the −10 (TATAAT) and −35 (TTGACA) hexamers, the 17 ± 1 bp spacer, and the AT-rich upstream element have been validated by decades of mutagenesis, footprinting, and structural studies. A classifier trained on these features is anchored to known biochemistry rather than statistical patterns of uncertain biological meaning.
+
+Because the core σ70 recognition logic is conserved across bacteria, these learned features transfer well to other species. In benchmarking across eleven species spanning seven phyla, ProFinder returned useful promoter shortlists (13–33 σ70 marker promoters) for every species with intergenic GC content below 50%, including organisms as distant from *E. coli* as *Bacillus subtilis* (Firmicutes), *Synechocystis* sp. PCC 6803 (Cyanobacteria), and *Vibrio cholerae* (Vibrionaceae). The critical variable is base composition, not phylogenetic distance: the AT-rich motifs that define σ70 promoters are present in low-to-moderate-GC genomes regardless of taxonomic position.
+
+## GC content limitation
+
+For organisms with intergenic GC content above approximately 60%, the pipeline will return fewer σ70 marker promoters. This is because the AT-rich features the classifier relies on are sparse in high-GC intergenic regions. The classifier rejects these sequences rather than misclassifying them, so the output remains reliable (no false positives).
 
 ## Requirements
 
@@ -73,15 +85,18 @@ The pipeline produces checkpoint files at each step. Re-running the same command
 | 10 | Predict promoters (PromoterLCNN) | `lcnn_predictions.tsv`, `promoter_markers_verified.tsv` |
 | 11 | Annotate CDS (Prokka) | `cds_annotations.tsv` |
 | 12 | Scan motifs with FIMO | `fimo/fimo_combined.tsv` |
-| 13 | Generate HTML report | `promoter_report.html` |
+| 13 | Build final output table | `profinder_results.tsv` |
+| 14 | Generate HTML report | `promoter_report.html` |
 
 Steps 4–5 use bundled TIGRfam and Pfam HMM profiles by default. You can override them with `--tigrfam` and `--pfam` if you have custom profiles.
 
-Step 10 runs PromoterLCNN on each marker-filtered promoter. The 3'-terminal 81 nt of each sequence (closest to the transcription start site) is passed through a two-stage CNN: a binary classifier filters non-promoters, and a sigma-factor classifier assigns one of six subtypes to each confirmed promoter. Sequences shorter than 81 nt are classified as non-promoters. Pre-trained weights are bundled in `weights/PromoterLCNN/`.
+Step 10 runs PromoterLCNN on all promoter-orientation IGRs (not just marker-filtered ones). The 3'-terminal 81 nt of each sequence (closest to the transcription start site) is passed through a two-stage CNN: a binary classifier filters non-promoters, and a sigma-factor classifier assigns one of six subtypes to each confirmed promoter. Sequences shorter than 81 nt are classified as non-promoters. Pre-trained weights are bundled in `weights/PromoterLCNN/`.
 
-Step 11 extracts protein product names directly from Prokka's GFF annotations for each verified promoter's associated CDS.
+Step 11 extracts gene names, locus tags, and protein product names from Prokka's GFF annotations for each promoter's associated CDS.
 
 Step 12 uses FIMO from the MEME Suite. Three motif databases are bundled with the pipeline (CollecTF, PRODORIC, RegTransBase). You can point to a different directory with `--motifs-dir`.
+
+Step 13 joins data from all previous steps into a single TSV (`profinder_results.tsv`) covering every promoter-orientation IGR. Columns include promoter ID, contig coordinates, associated CDS annotation (gene name, locus tag, product), marker status, LCNN prediction and sigma-factor subtype, FIMO motif hits, and the full-length 5'→3' sequence.
 
 ## CDS annotation
 
@@ -126,7 +141,7 @@ Required:
 
 Step control:
   --start N              First step to run (default: 1)
-  --end N                Last step to run (default: 13)
+  --end N                Last step to run (default: 14)
   --list                 List steps and exit
   --force                Re-run all steps, ignoring checkpoints
 
@@ -176,6 +191,7 @@ output/
 │   ├── prodoric_2021.9/
 │   ├── regtransbase/
 │   └── fimo_combined.tsv
+├── profinder_results.tsv        # Comprehensive results table
 └── promoter_report.html         # Visual HTML report
 ```
 
