@@ -1064,8 +1064,10 @@ def step13_generate_report(cfg: Config, force: bool = False):
 
     genome_name = cfg.input_fasta.stem
 
-    # Paths for the all-promoters FASTA link (relative to output dir)
+    # Paths for file links (relative to output dir)
     all_promo_name = cfg.all_promoter_fasta.name if cfg.all_promoter_fasta.exists() else ""
+    verified_tsv_name = cfg.promoter_markers_verified.name if cfg.promoter_markers_verified.exists() else ""
+    promoters_fasta_name = cfg.promoter_fasta.name if cfg.promoter_fasta.exists() else ""
 
     html_parts = [_REPORT_HTML_HEAD.format(
         genome_name=html_mod.escape(genome_name),
@@ -1075,6 +1077,8 @@ def step13_generate_report(cfg: Config, force: bool = False):
         n_with_motifs=n_with_motifs,
         total_fimo=sum(len(v) for v in fimo_by_promoter.values()),
         all_promoters_fasta=html_mod.escape(all_promo_name),
+        verified_tsv=html_mod.escape(verified_tsv_name),
+        promoters_fasta=html_mod.escape(promoters_fasta_name),
     )]
 
     # Legend
@@ -1100,7 +1104,6 @@ def step13_generate_report(cfg: Config, force: bool = False):
         <th>Sigma type</th>
         <th>Associated CDS</th>
         <th>Protein</th>
-        <th>Motif hits</th>
         <th>Sequence diagram</th>
         <th>Sequence (5'→3')</th>
     </tr>
@@ -1113,11 +1116,6 @@ def step13_generate_report(cfg: Config, force: bool = False):
         gene = row["associated_gene"]
         product = annotation_map.get(gene, "")
         motif_hits = fimo_by_promoter.get(igr_id, [])
-
-        motif_count = len(motif_hits)
-        motif_names = ", ".join(sorted(set(
-            h.get("motif_alt_id") or h.get("motif_id", "") for h in motif_hits
-        )))[:80]
 
         svg = _build_motif_diagram_svg(row["length"], motif_hits)
 
@@ -1139,7 +1137,6 @@ def step13_generate_report(cfg: Config, force: bool = False):
             <td>{html_mod.escape(sigma_display) if sigma_display else '<span class="na">—</span>'}</td>
             <td><code>{html_mod.escape(str(gene))}</code></td>
             <td>{product_cell}</td>
-            <td>{motif_count}{(' (' + html_mod.escape(motif_names) + ')') if motif_names else ''}</td>
             <td>{svg}</td>
             <td><code class="seq">{html_mod.escape(str(seq))}</code></td>
         </tr>
@@ -1270,8 +1267,13 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
     This report shows the <strong>{n_marker_promoters}</strong> verified promoters (marker-filtered, CNN-confirmed).
-    A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome
-    (<a href="{all_promoters_fasta}">all_promoters.fasta</a>).
+    A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome.
+</p>
+<p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
+    <strong>Downloads:</strong>
+    <a href="{promoters_fasta}">promoters.fasta</a> ·
+    <a href="{verified_tsv}">promoter_markers_verified.tsv</a> ·
+    <a href="{all_promoters_fasta}">all_promoters.fasta</a>
 </p>
 
 <h2>Verified promoters</h2>
@@ -1359,8 +1361,8 @@ def main():
                         help="Prokka --kingdom (default: Bacteria)")
     parser.add_argument("--prefix", default="genome",
                         help="Prokka --prefix (default: genome)")
-    parser.add_argument("--igr-min", type=int, default=75,
-                        help="Minimum IGR length (default: 75)")
+    parser.add_argument("--igr-min", type=int, default=81,
+                        help="Minimum IGR length (default: 81)")
     parser.add_argument("--igr-max", type=int, default=1000,
                         help="Maximum IGR length (default: 1000)")
     parser.add_argument("--max-internal-dist", type=int, default=25,
