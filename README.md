@@ -1,8 +1,8 @@
 # ProFinder
 
-Identify and extract bacterial promoter sequences from a single genome FASTA file, annotate their associated coding sequences via BLAST, scan for known transcription factor binding motifs, and produce an HTML report.
+Identify and extract bacterial promoter sequences from a single genome FASTA file, annotate their associated coding sequences, scan for known transcription factor binding motifs, and produce an HTML report.
 
-The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions (IGRs) between annotated genes, identifies operons using a two-pass proximity/flanking-distance algorithm, screens for marker genes via hmmsearch against TIGRfam and Pfam (HMM profiles are bundled), and outputs promoter sequences oriented 5'→3'. It then BLASTs the associated CDS proteins against Swiss-Prot for functional annotation and organism identification, scans promoters for known motifs with FIMO, and generates a visual HTML report.
+The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions (IGRs) between annotated genes, identifies operons using a two-pass proximity/flanking-distance algorithm, screens for marker genes via hmmsearch against TIGRfam and Pfam (HMM profiles are bundled), and outputs promoter sequences oriented 5'→3'. Candidate promoters are then verified with [PromoterLCNN](https://github.com/occasumlux/Promoters), a two-stage CNN that classifies each sequence as promoter or non-promoter and assigns a sigma-factor subtype (σ70, σ24, σ28, σ38, σ32, σ54). CDS functional annotations come from Prokka's gene product predictions. Promoters are scanned for known motifs with FIMO, and a visual HTML report is generated.
 
 All databases ship with the pipeline. No additional downloads are needed beyond installing the external tools.
 
@@ -12,11 +12,11 @@ All databases ship with the pipeline. No additional downloads are needed beyond 
 
 - pandas ≥ 1.3
 - biopython ≥ 1.79
+- tensorflow ≥ 2.6
 
 **External tools** (must be on `$PATH` or specified via CLI flags):
 
 - [Prokka](https://github.com/tseemann/prokka)
-- [BLAST+](https://blast.ncbi.nlm.nih.gov/doc/blast-help/downloadblastdata.html) (for CDS annotation; uses NCBI remote BLAST by default, no local database required)
 - [MEME Suite](https://meme-suite.org/) (specifically `fimo`, for motif scanning)
 - [HMMER](http://hmmer.org/) (for marker gene screening; HMM profiles are bundled)
 
@@ -34,17 +34,10 @@ pip install -e .
 
 ## Quick start
 
-Minimal run (bundled HMMs and motifs, remote BLAST for CDS annotation):
+Minimal run (bundled HMMs and motifs):
 
 ```bash
 profinder -i my_genome.fasta -o results/
-```
-
-With a local BLAST database (faster than remote):
-
-```bash
-profinder -i my_genome.fasta -o results/ \
-    --blast-local-db /path/to/swissprot
 ```
 
 Override bundled HMMs with your own:
@@ -77,21 +70,24 @@ The pipeline produces checkpoint files at each step. Re-running the same command
 | 7 | Match IGRs to marker operons | `promoter_markers.tsv` |
 | 8 | Extract marker-filtered promoters | `promoters.fasta`, `promoters_short.fasta` |
 | 9 | Extract all promoter-orientation IGRs | `all_promoters.fasta`, `all_promoters_short.fasta` |
-| 10 | Annotate CDS via BLAST | `blast/cds_annotations.tsv` |
-| 11 | Scan motifs with FIMO | `fimo/fimo_combined.tsv` |
-| 12 | Generate HTML report | `promoter_report.html` |
+| 10 | Predict promoters (PromoterLCNN) | `lcnn_predictions.tsv`, `promoter_markers_verified.tsv` |
+| 11 | Annotate CDS (Prokka) | `cds_annotations.tsv` |
+| 12 | Scan motifs with FIMO | `fimo/fimo_combined.tsv` |
+| 13 | Generate HTML report | `promoter_report.html` |
 
 Steps 4–5 use bundled TIGRfam and Pfam HMM profiles by default. You can override them with `--tigrfam` and `--pfam` if you have custom profiles.
 
-Step 10 uses NCBI remote BLAST against Swiss-Prot by default. This requires an internet connection and can take several minutes depending on the number of CDS queries. Provide `--blast-local-db` to use a pre-formatted local database instead.
+Step 10 runs PromoterLCNN on each marker-filtered promoter. The 3'-terminal 81 nt of each sequence (closest to the transcription start site) is passed through a two-stage CNN: a binary classifier filters non-promoters, and a sigma-factor classifier assigns one of six subtypes to each confirmed promoter. Sequences shorter than 81 nt are classified as non-promoters. Pre-trained weights are bundled in `weights/PromoterLCNN/`.
 
-Step 11 uses FIMO from the MEME Suite. Three motif databases are bundled with the pipeline (CollecTF, PRODORIC, RegTransBase). You can point to a different directory with `--motifs-dir`.
+Step 11 extracts protein product names directly from Prokka's GFF annotations for each verified promoter's associated CDS.
+
+Step 12 uses FIMO from the MEME Suite. Three motif databases are bundled with the pipeline (CollecTF, PRODORIC, RegTransBase). You can point to a different directory with `--motifs-dir`.
 
 ## CDS annotation
 
 Each promoter is associated with its immediately downstream CDS based on orientation. For CO_F promoters (both flanking genes on the + strand), the right gene is the associated CDS. For CO_R (both on the − strand), the left gene is the associated CDS, because that gene's transcription start site faces the IGR.
 
-Prokka annotations are used only for gene coordinates. Functional annotation comes from BLASTing the translated CDS protein against Swiss-Prot, which provides a curated protein name and source organism for each hit. The pipeline extracts protein name and organism from the Swiss-Prot title format (`OS=` and `OX=` fields).
+Functional annotation uses the `product=` field from Prokka's GFF output for each associated CDS.
 
 ## Motif scanning
 
@@ -130,7 +126,7 @@ Required:
 
 Step control:
   --start N              First step to run (default: 1)
-  --end N                Last step to run (default: 12)
+  --end N                Last step to run (default: 13)
   --list                 List steps and exit
   --force                Re-run all steps, ignoring checkpoints
 
@@ -139,10 +135,7 @@ Tool paths:
   --hmmsearch PATH       hmmsearch binary (default: hmmsearch)
   --tigrfam PATH         TIGRfam HMM database
   --pfam PATH            Pfam-A HMM database
-  --blastp PATH          blastp binary (default: blastp)
-  --blast-db NAME        NCBI remote database (default: swissprot)
-  --blast-local-db PATH  Local BLAST database (overrides remote)
-  --blast-evalue F       BLAST e-value threshold (default: 1e-5)
+  --lcnn-weights DIR     PromoterLCNN weights directory (default: bundled)
   --fimo PATH            fimo binary (default: fimo)
   --motifs-dir DIR       Directory of .meme files (default: bundled)
   --fimo-threshold F     FIMO p-value threshold (default: 1e-4)
@@ -150,7 +143,6 @@ Tool paths:
 Conda environments:
   --conda-prokka ENV     Conda env for Prokka (blank = current env)
   --conda-hmm ENV        Conda env for hmmsearch (blank = current env)
-  --conda-blast ENV      Conda env for BLAST+ (blank = current env)
   --conda-meme ENV       Conda env for MEME Suite (blank = current env)
 
 Parameters:
@@ -176,10 +168,9 @@ output/
 ├── hmm/                         # HMM marker screening (optional)
 ├── promoters.fasta              # Marker-filtered promoters
 ├── all_promoters.fasta          # All promoter-orientation IGRs
-├── blast/                       # CDS annotation
-│   ├── query_proteins.faa
-│   ├── blastp_results.tsv
-│   └── cds_annotations.tsv
+├── lcnn_predictions.tsv         # PromoterLCNN per-sequence predictions
+├── promoter_markers_verified.tsv # Promoters confirmed by CNN
+├── cds_annotations.tsv          # CDS product names from Prokka
 ├── fimo/                        # Motif scanning
 │   ├── collectf/
 │   ├── prodoric_2021.9/
