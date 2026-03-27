@@ -157,6 +157,11 @@ class Config:
     def fimo_combined(self) -> Path:
         return self.fimo_dir / "fimo_combined.tsv"
 
+    # ── Final output table ─────────────────────────────────────────────
+    @property
+    def final_table(self) -> Path:
+        return self.output_dir / "profinder_results.tsv"
+
     # ── Report ────────────────────────────────────────────────────────
     @property
     def report_html(self) -> Path:
