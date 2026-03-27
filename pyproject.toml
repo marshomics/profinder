@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "profinder"
+version = "0.1.0"
+description = "ProFinder — identify and extract bacterial promoter sequences from a single genome, annotate CDS via BLAST, scan for motifs, and generate an HTML report"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.7"
+authors = [
+    {name = "James Marsh"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "pandas>=1.3",
+    "biopython>=1.79",
+]
+
+[project.scripts]
+profinder = "profinder.pipeline:main"
+
+[project.urls]
+Repository = "https://github.com/jmarsh/profinder"
+
+[tool.setuptools.packages.find]
+include = ["profinder*"]
+
+[tool.setuptools.package-data]
+profinder = ["motifs/*.meme", "hmms/*.hmm"]
