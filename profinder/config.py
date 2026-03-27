@@ -49,7 +49,7 @@ class Config:
     prokka_prefix: str = "genome"
 
     # ── IGR extraction parameters ────────────────────────────────────
-    igr_size_min: int = 75
+    igr_size_min: int = 81
     igr_size_max: int = 1000
 
     # ── Operon identification parameters ─────────────────────────────
