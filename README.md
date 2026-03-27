@@ -2,6 +2,10 @@
 
 A bacterial promoter identification pipeline that extracts high-confidence constitutive (σ70) promoter candidates from any genome assembly. Given a FASTA file, ProFinder returns a curated shortlist of promoter sequences upstream of conserved housekeeping genes, ready for integration into genetic system development workflows.
 
+<p align="center">
+  <img src="pipeline.png" width="600">
+</p>
+
 ## What ProFinder does
 
 ProFinder is built for a specific use case: identifying constitutive promoters that are likely to drive reliable expression in a microbe of interest. It is not a genome-wide promoter annotation tool. Instead of returning thousands of candidate sites with varying confidence, ProFinder applies a series of biologically motivated filters to produce a short, high-confidence list of σ70 (constitutive) promoter sequences upstream of single-copy phylogenetic marker genes (ribosomal proteins, tRNA synthetases, DNA replication components, and other essential housekeeping functions). These marker genes are known to be expressed across growth conditions because the cell cannot afford to silence them, and their promoters are strong candidates for use in expression constructs, reporter systems, and metabolic engineering.
