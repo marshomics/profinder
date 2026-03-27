@@ -3,7 +3,7 @@
 A bacterial promoter identification pipeline that extracts high-confidence constitutive (σ70) promoter candidates from any genome assembly. Given a FASTA file, ProFinder returns a curated shortlist of promoter sequences upstream of conserved housekeeping genes, ready for integration into genetic system development workflows.
 
 <p align="center">
-  <img src="pipeline.png" width="600">
+  <img src="pipeline.png" width="100%">
 </p>
 
 ## What ProFinder does
