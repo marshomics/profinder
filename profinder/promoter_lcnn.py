@@ -62,8 +62,11 @@ def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
     never pay the import cost.
     """
     import tensorflow as tf  # noqa: delayed import
-    model1 = tf.keras.models.load_model(str(is_promoter_dir))
-    model2 = tf.keras.models.load_model(str(promoters_only_dir))
+    # compile=False skips optimizer restoration — we only need forward passes,
+    # and the original models were trained with tensorflow-addons' LazyAdam
+    # which may not be installed at inference time.
+    model1 = tf.keras.models.load_model(str(is_promoter_dir), compile=False)
+    model2 = tf.keras.models.load_model(str(promoters_only_dir), compile=False)
     return model1, model2
 
 
