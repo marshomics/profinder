@@ -72,7 +72,16 @@ def _build_model():
     the saved weights map onto the right layers.
     """
     import os
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    import logging
+    logging.getLogger("tensorflow").setLevel(logging.ERROR)
+    try:
+        import absl.logging
+        absl.logging.set_verbosity(absl.logging.ERROR)
+        logging.getLogger("absl").setLevel(logging.ERROR)
+    except ImportError:
+        pass
     from tensorflow.keras.layers import (Conv1D, MaxPooling1D, Dropout,
                                          Flatten, Dense, Input)
     from tensorflow.keras import regularizers, Model
