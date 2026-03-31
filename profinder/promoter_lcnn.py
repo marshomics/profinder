@@ -60,25 +60,85 @@ def _encode_sequences(seqs: List[str]) -> np.ndarray:
     return np.array(encoded, dtype=np.float32)
 
 
+# ── Model loading ──────────────────────────────────────────────────
+
+def _load_saved_model(path, tf):
+    """Load a TensorFlow SavedModel directory, handling both Keras 2 and
+    Keras 3 (TensorFlow ≥ 2.16).
+
+    Keras 3 dropped support for ``tf.keras.models.load_model()`` on
+    legacy SavedModel directories.  In that case we fall back to
+    ``keras.layers.TFSMLayer``, which wraps the SavedModel as an
+    inference-only callable layer.
+    """
+    try:
+        return tf.keras.models.load_model(str(path), compile=False)
+    except (ValueError, TypeError):
+        # Keras 3+: use TFSMLayer for legacy SavedModel directories.
+        return tf.keras.layers.TFSMLayer(
+            str(path), call_endpoint="serving_default"
+        )
+
+
 # ── Public API ──────────────────────────────────────────────────────
 def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
     """Load the two SavedModel directories and return a (model1, model2) tuple.
 
     Lazy-imports TensorFlow so that modules that don't call this function
-    never pay the import cost.
+    never pay the import cost.  Works with both Keras 2
+    (``tf.keras.models.load_model``) and Keras 3 / TF ≥ 2.16
+    (``TFSMLayer`` fallback for legacy SavedModel directories).
     """
     import os
-    # Suppress TensorFlow informational/warning logs (GPU probing, TensorRT,
-    # oneDNN notices) that clutter pipeline output on CPU-only machines.
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    # Suppress TensorFlow C++ runtime logs (CUDA probing, TensorRT,
+    # oneDNN, absl warnings) BEFORE importing TF.  Level 3 = FATAL only.
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    # Suppress absl logging that leaks through before TF's own logger
+    # is configured (the "All log messages before absl::InitializeLog()"
+    # warnings and cudart_stub notices).
+    import logging
+    logging.getLogger("tensorflow").setLevel(logging.ERROR)
+    try:
+        import absl.logging
+        absl.logging.set_verbosity(absl.logging.ERROR)
+        logging.getLogger("absl").setLevel(logging.ERROR)
+    except ImportError:
+        pass
     import tensorflow as tf  # noqa: delayed import
     tf.get_logger().setLevel("ERROR")
-    # compile=False skips optimizer restoration — we only need forward passes,
-    # and the original models were trained with tensorflow-addons' LazyAdam
-    # which may not be installed at inference time.
-    model1 = tf.keras.models.load_model(str(is_promoter_dir), compile=False)
-    model2 = tf.keras.models.load_model(str(promoters_only_dir), compile=False)
+
+    model1 = _load_saved_model(is_promoter_dir, tf)
+    model2 = _load_saved_model(promoters_only_dir, tf)
     return model1, model2
+
+
+def _run_inference(model, encoded: np.ndarray) -> np.ndarray:
+    """Run a forward pass, normalising the output to a plain ndarray.
+
+    When loaded via ``tf.keras.models.load_model`` (Keras 2), calling
+    ``model.predict(x)`` returns an ndarray directly.
+
+    When loaded via ``TFSMLayer`` (Keras 3), calling the layer returns
+    a dict mapping output-tensor names to tensors.  We extract the
+    single output value and convert it to numpy.
+    """
+    # TFSMLayer is a layer, not a Model — it has no .predict() in the
+    # Keras 2 sense.  Use __call__ which works for both.
+    import tensorflow as tf
+
+    result = model(tf.constant(encoded))
+
+    if isinstance(result, dict):
+        # TFSMLayer returns {"output_name": tensor}.  Grab the first
+        # (and typically only) value.
+        result = next(iter(result.values()))
+
+    # Convert to numpy if it's still a tensor.
+    if hasattr(result, "numpy"):
+        result = result.numpy()
+
+    return np.asarray(result)
 
 
 def predict(
@@ -110,7 +170,7 @@ def predict(
     encoded = _encode_sequences(sequences)  # (N, 81, 4)
 
     # Stage 1 — binary: class 0 = non-promoter, class ≥ 1 = promoter
-    stage1_preds = is_promoter_model.predict(encoded, verbose=0)
+    stage1_preds = _run_inference(is_promoter_model, encoded)
     stage1_labels = stage1_preds.argmax(axis=1).ravel()
 
     results = [PromoterType.NON_PROMOTER] * n
@@ -122,7 +182,7 @@ def predict(
 
     # Stage 2 — sigma subtype classification on promoter subset
     encoded_sub = encoded[promoter_idx]
-    stage2_preds = sigma_model.predict(encoded_sub, verbose=0)
+    stage2_preds = _run_inference(sigma_model, encoded_sub)
     stage2_labels = stage2_preds.argmax(axis=1).ravel()
 
     for j, idx in enumerate(promoter_idx):
