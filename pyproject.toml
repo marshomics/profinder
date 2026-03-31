@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "profinder"
 version = "0.1.0"
-description = "ProFinder — identify and extract bacterial promoter sequences from a single genome, scan for motifs, and generate an HTML report"
+description = "ProFinder — identify and extract bacterial or archaeal promoter sequences from a single genome, scan for motifs, and generate an HTML report"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.7"
