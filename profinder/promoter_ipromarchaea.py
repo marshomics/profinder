@@ -99,9 +99,14 @@ def _build_model():
                                          Flatten, Dense, Input)
     from tensorflow.keras import regularizers, Model
 
+    # Architecture derived from the actual saved weight shapes:
+    #   conv1d   kernel (2, 1, 8)   → 8 filters
+    #   conv1d_1 kernel (2, 8, 16)  → 16 filters
+    #   dense    kernel (16352, 99) → 99 units
+    #   dense_1  kernel (99, 1)     → 1 unit (sigmoid output)
     input_shape = (4 ** _K, 1)  # (4096, 1)
     inputs = Input(shape=input_shape)
-    x = Conv1D(filters=16, kernel_size=2, activation='relu',
+    x = Conv1D(filters=8, kernel_size=2, activation='relu',
                kernel_regularizer=regularizers.l2(1e-5))(inputs)
     x = MaxPooling1D(pool_size=2, strides=2)(x)
     x = Conv1D(filters=16, kernel_size=2, activation='relu',
@@ -109,7 +114,7 @@ def _build_model():
     x = MaxPooling1D(pool_size=4, strides=2)(x)
     x = Flatten()(x)
     x = Dropout(0.22)(x)
-    x = Dense(100, activation='relu',
+    x = Dense(99, activation='relu',
               kernel_regularizer=regularizers.l2(1e-4))(x)
     x = Dropout(0.25)(x)
     out = Dense(1, activation='sigmoid')(x)
@@ -135,8 +140,16 @@ def load_model(weights_path: Path):
     tensorflow.keras.Model
         Compiled model ready for inference.
     """
+    import warnings
     model = _build_model()
-    model.load_weights(str(weights_path))
+    # The .h5 file includes optimizer state (Adam slot variables) that
+    # won't match our freshly compiled model.  This is harmless — we
+    # only need the layer weights for inference.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=".*Skipping variable loading for optimizer.*"
+        )
+        model.load_weights(str(weights_path))
     return model
 
 
