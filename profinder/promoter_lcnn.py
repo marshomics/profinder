@@ -62,22 +62,81 @@ def _encode_sequences(seqs: List[str]) -> np.ndarray:
 
 # ── Model loading ──────────────────────────────────────────────────
 
+def _patch_user_object_for_optimizer(tf):
+    """Monkey-patch ``_UserObject`` so ``tf.saved_model.load()`` can skip
+    over tensorflow-addons optimizer state that Keras 3 / TF 2.16+
+    cannot deserialize.
+
+    The patch adds a no-op ``add_slot`` (and a few related helpers) so
+    the loader silently absorbs the optimizer checkpoint variables
+    instead of crashing with ``AttributeError: '_UserObject' object has
+    no attribute 'add_slot'``.
+
+    The patch is applied once and is idempotent.
+    """
+    try:
+        from tensorflow.python.saved_model.load import _UserObject
+    except ImportError:
+        return  # older TF, patch not needed
+
+    if hasattr(_UserObject, "_patched_for_promoter_lcnn"):
+        return  # already patched
+
+    def _noop_add_slot(self, var, slot_name, initializer="zeros"):
+        """No-op: discard optimizer slot variables during loading."""
+        import tensorflow as _tf
+        return _tf.Variable(0.0, trainable=False, name=f"discarded/{slot_name}")
+
+    _UserObject.add_slot = _noop_add_slot
+
+    # Some optimizer checkpoints also reference .iterations or .lr
+    if not hasattr(_UserObject, "iterations"):
+        _UserObject.iterations = property(
+            lambda self: tf.Variable(0, trainable=False, dtype=tf.int64)
+        )
+
+    _UserObject._patched_for_promoter_lcnn = True
+
+
 def _load_saved_model(path, tf):
     """Load a TensorFlow SavedModel directory, handling both Keras 2 and
     Keras 3 (TensorFlow ≥ 2.16).
 
-    Keras 3 dropped support for ``tf.keras.models.load_model()`` on
-    legacy SavedModel directories.  In that case we fall back to
-    ``keras.layers.TFSMLayer``, which wraps the SavedModel as an
-    inference-only callable layer.
+    Three strategies are tried in order:
+
+    1. ``tf.keras.models.load_model()`` — works on TF < 2.16.
+    2. ``TFSMLayer`` — works on Keras 3 when the SavedModel has no
+       problematic optimizer state.
+    3. ``tf.saved_model.load()`` with a monkey-patched ``_UserObject``
+       so tensorflow-addons optimizer state is silently discarded.
+       The serving signature is then extracted for inference.
     """
+    # --- Attempt 1: Keras 2-style load (works on TF < 2.16) -----------
     try:
         return tf.keras.models.load_model(str(path), compile=False)
     except (ValueError, TypeError):
-        # Keras 3+: use TFSMLayer for legacy SavedModel directories.
+        pass
+
+    # --- Attempt 2: TFSMLayer (Keras 3, clean SavedModels) ------------
+    try:
         return tf.keras.layers.TFSMLayer(
             str(path), call_endpoint="serving_default"
         )
+    except (AttributeError, ValueError, TypeError):
+        pass
+
+    # --- Attempt 3: patch + raw saved_model.load ----------------------
+    _patch_user_object_for_optimizer(tf)
+    obj = tf.saved_model.load(str(path))
+    if hasattr(obj, "signatures") and "serving_default" in obj.signatures:
+        return obj.signatures["serving_default"]
+    if callable(obj):
+        return obj
+    raise RuntimeError(
+        f"Cannot load SavedModel at {path}: no usable serving "
+        f"signature or callable found after all loading strategies "
+        f"were exhausted."
+    )
 
 
 # ── Public API ──────────────────────────────────────────────────────
@@ -116,25 +175,38 @@ def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
 def _run_inference(model, encoded: np.ndarray) -> np.ndarray:
     """Run a forward pass, normalising the output to a plain ndarray.
 
-    When loaded via ``tf.keras.models.load_model`` (Keras 2), calling
-    ``model.predict(x)`` returns an ndarray directly.
+    Handles three loader flavours:
 
-    When loaded via ``TFSMLayer`` (Keras 3), calling the layer returns
-    a dict mapping output-tensor names to tensors.  We extract the
-    single output value and convert it to numpy.
+    * Keras ``Model`` (from ``load_model``) — call directly, returns
+      ndarray or tensor.
+    * ``TFSMLayer`` — call directly, returns a dict of tensors.
+    * ``ConcreteFunction`` (from ``tf.saved_model.load().signatures``)
+      — must be called with **keyword** arguments and returns a dict
+      of tensors.
     """
-    # TFSMLayer is a layer, not a Model — it has no .predict() in the
-    # Keras 2 sense.  Use __call__ which works for both.
     import tensorflow as tf
 
-    result = model(tf.constant(encoded))
+    tensor_in = tf.constant(encoded)
+
+    # ConcreteFunction (from signatures dict) expects keyword args.
+    # Its structured_input_signature tells us the expected key name,
+    # but the most reliable approach is to inspect the function's
+    # argument names.
+    if hasattr(model, "structured_input_signature"):
+        # It's a ConcreteFunction — get the keyword name from its
+        # input signature (second element is the kwargs dict).
+        _, kwarg_spec = model.structured_input_signature
+        if kwarg_spec:
+            key = next(iter(kwarg_spec))
+            result = model(**{key: tensor_in})
+        else:
+            result = model(tensor_in)
+    else:
+        result = model(tensor_in)
 
     if isinstance(result, dict):
-        # TFSMLayer returns {"output_name": tensor}.  Grab the first
-        # (and typically only) value.
         result = next(iter(result.values()))
 
-    # Convert to numpy if it's still a tensor.
     if hasattr(result, "numpy"):
         result = result.numpy()
 
