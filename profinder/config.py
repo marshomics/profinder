@@ -1,5 +1,6 @@
 """
-Configuration for ProFinder — bacterial promoter identification pipeline.
+Configuration for ProFinder — bacterial and archaeal promoter identification
+pipeline.
 
 All paths are resolved at runtime so they work whether passed via CLI
 or set in the dataclass defaults.
@@ -14,6 +15,9 @@ class Config:
     # ── Required inputs (typically set via CLI) ──────────────────────
     input_fasta: Path = Path("genome.fasta")
     output_dir: Path = Path("output")
+
+    # ── Domain selection ─────────────────────────────────────────────
+    domain: str = "bacteria"  # "bacteria" or "archaea"
 
     # ── Tool paths ───────────────────────────────────────────────────
     prokka_bin: str = "prokka"
@@ -39,6 +43,13 @@ class Config:
         if self.lcnn_weights_dir is None:
             candidate = Path(__file__).parent / "weights" / "PromoterLCNN"
             self.lcnn_weights_dir = candidate if candidate.is_dir() else None
+        if self.ipromarchaea_weights is None:
+            candidate = (Path(__file__).parent / "weights" / "iPromArchaea"
+                         / "model_cnn.weights.h5")
+            self.ipromarchaea_weights = candidate if candidate.exists() else None
+
+        # Normalise domain to lowercase
+        self.domain = self.domain.lower()
 
     # ── Parallelism ──────────────────────────────────────────────────
     threads: int = 4
@@ -59,8 +70,14 @@ class Config:
     # ── HMM filtering ────────────────────────────────────────────────
     hmm_bitscore_min: float = 25.0
 
-    # ── PromoterLCNN parameters ────────────────────────────────────────
+    # ── PromoterLCNN parameters (bacteria) ──────────────────────────────
     lcnn_weights_dir: Path = None     # parent dir containing IsPromoter_fold_5/ and PromotersOnly_fold_1/
+
+    # ── iProm-Archaea parameters (archaea) ───────────────────────────
+    ipromarchaea_weights: Path = None  # .h5 weights file for the archaeal CNN
+
+    # ── CDS extension ────────────────────────────────────────────────
+    cds_bp: int = 0                   # number of CDS-start nt to append (0 = disabled)
 
     # ── FIMO parameters ──────────────────────────────────────────────
     motifs_dir: Path = None           # directory containing .meme files
@@ -139,7 +156,28 @@ class Config:
     def all_promoter_fasta_short(self) -> Path:
         return self.output_dir / "all_promoters_short.fasta"
 
-    # ── PromoterLCNN output ────────────────────────────────────────────
+    # ── CDS-extended FASTA outputs ──────────────────────────────────
+    @property
+    def promoter_cds_fasta(self) -> Path:
+        return self.output_dir / "promoters_cds_bp.fasta"
+
+    @property
+    def promoter_cds_fasta_short(self) -> Path:
+        return self.output_dir / "promoters_short_cds_bp.fasta"
+
+    @property
+    def all_promoter_cds_fasta(self) -> Path:
+        return self.output_dir / "all_promoters_cds_bp.fasta"
+
+    @property
+    def all_promoter_cds_fasta_short(self) -> Path:
+        return self.output_dir / "all_promoters_short_cds_bp.fasta"
+
+    @property
+    def is_archaea(self) -> bool:
+        return self.domain == "archaea"
+
+    # ── Promoter prediction output ────────────────────────────────────
     @property
     def lcnn_predictions(self) -> Path:
         return self.output_dir / "lcnn_predictions.tsv"
