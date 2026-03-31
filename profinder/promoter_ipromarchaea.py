@@ -72,6 +72,7 @@ def _build_model():
     the saved weights map onto the right layers.
     """
     import os
+    import sys
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
     import logging
@@ -82,11 +83,21 @@ def _build_model():
         logging.getLogger("absl").setLevel(logging.ERROR)
     except ImportError:
         pass
+    # Redirect C stderr to /dev/null during TF import to suppress
+    # absl::InitializeLog() and cudart_stub.cc messages.
+    _orig_fd = os.dup(2)
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 2)
+    try:
+        import tensorflow as tf
+    finally:
+        os.dup2(_orig_fd, 2)
+        os.close(_orig_fd)
+        os.close(_devnull)
+    tf.get_logger().setLevel("ERROR")
     from tensorflow.keras.layers import (Conv1D, MaxPooling1D, Dropout,
                                          Flatten, Dense, Input)
     from tensorflow.keras import regularizers, Model
-    import tensorflow as tf
-    tf.get_logger().setLevel("ERROR")
 
     input_shape = (4 ** _K, 1)  # (4096, 1)
     inputs = Input(shape=input_shape)
