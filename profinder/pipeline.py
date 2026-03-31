@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-ProFinder — bacterial promoter identification pipeline.
+ProFinder — bacterial and archaeal promoter identification pipeline.
 
 Takes a single genome FASTA, annotates it with Prokka, extracts
 intergenic regions, identifies operons, screens for HMM marker genes,
 and outputs promoter sequences in 5'-to-3' orientation.
+
+Use ``--domain bacteria`` (default) for σ70 promoter prediction via
+PromoterLCNN, or ``--domain archaea`` for binary promoter prediction
+via iProm-Archaea.
 
 Usage
 -----
@@ -38,7 +42,7 @@ Steps
     7.  Match IGRs to marker operons
     8.  Extract promoter sequences (marker-filtered)
     9.  Extract all promoter sequences (orientation-based, no HMM filter)
-    10. Predict promoters with PromoterLCNN (final filter)
+    10. Predict promoters (PromoterLCNN for bacteria, iProm-Archaea for archaea)
     11. Annotate associated CDS (Prokka product names, gene, locus tag)
     12. Scan promoters for motifs (FIMO)
     13. Build final output table (all promoters, all metadata)
@@ -514,6 +518,79 @@ def _write_fasta(df, output_path, short_header=False):
     print(f"  FASTA ({len(df)} seqs, short={short_header}) -> {output_path}")
 
 
+def _load_contigs(fasta_path):
+    """Load contig sequences from a genome FASTA into a dict."""
+    from Bio import SeqIO
+    return {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
+
+
+def _extract_cds_start(row, contigs, n_bp):
+    """Return the first *n_bp* nucleotides of the CDS downstream of a
+    promoter, oriented 5'→3' on the coding strand.
+
+    For CO_F the downstream CDS is the right gene, sitting on the +
+    strand immediately after the IGR.  Its first *n_bp* nt run left-to-
+    right starting at ``igr_end + 1``.
+
+    For CO_R the downstream CDS is the left gene, sitting on the −
+    strand immediately before the IGR.  Its coding sequence starts at
+    ``igr_start - 1`` and runs right-to-left.  We extract the last
+    *n_bp* nt of the forward strand up to that position and reverse-
+    complement them.
+
+    Returns an empty string if the contig is missing or there aren't
+    enough nucleotides available.
+    """
+    contig_seq = contigs.get(row["contig"], "")
+    if not contig_seq:
+        return ""
+
+    orient = row["orientation"]
+    if orient == "CO_F":
+        # CDS starts at igr_end + 1 (1-based), on the + strand.
+        cds_start_0 = row["end"]            # 0-based start (= igr_end in 1-based)
+        fragment = contig_seq[cds_start_0 : cds_start_0 + n_bp]
+    elif orient == "CO_R":
+        # CDS ends at igr_start - 1 (1-based) on the + strand, but the
+        # gene is on the − strand, so its coding sequence begins at the
+        # high coordinate and runs leftward.
+        cds_end_0 = row["start"] - 1        # 0-based position (= igr_start - 1 in 1-based)
+        start_0 = max(0, cds_end_0 - n_bp)
+        fragment = _reverse_complement(contig_seq[start_0 : cds_end_0])
+    else:
+        return ""
+
+    return fragment
+
+
+def _add_cds_column(df, contigs, n_bp):
+    """Add a ``cds_start_seq`` column with the first *n_bp* nt of CDS,
+    and a ``sequence_5p_to_3p_cds`` column with promoter + CDS joined.
+    """
+    df["cds_start_seq"] = df.apply(
+        lambda r: _extract_cds_start(r, contigs, n_bp), axis=1)
+    df["sequence_5p_to_3p_cds"] = df["sequence_5p_to_3p"] + df["cds_start_seq"]
+    return df
+
+
+def _write_fasta_cds(df, output_path, short_header=False):
+    """Write promoter+CDS FASTA from a DataFrame that has
+    ``sequence_5p_to_3p_cds``.
+    """
+    with open(output_path, "w") as fh:
+        for _, row in df.iterrows():
+            seq = row["sequence_5p_to_3p_cds"]
+            igr_id = row["igr_id"]
+            orient = row["orientation"]
+            if short_header:
+                header = f">{igr_id}_{orient}"
+            else:
+                header = (f">{igr_id}_{row['contig']}_{orient}"
+                          f"_{row['left_gene']}_{row['right_gene']}")
+            fh.write(f"{header}\n{seq}\n")
+    print(f"  FASTA+CDS ({len(df)} seqs, short={short_header}) -> {output_path}")
+
+
 def step08_extract_marker_promoters(cfg: Config, force: bool = False):
     """Extract marker-filtered promoter sequences in 5'→3' orientation."""
     if not force and cfg.promoter_fasta_short.exists():
@@ -546,6 +623,13 @@ def step08_extract_marker_promoters(cfg: Config, force: bool = False):
 
     _write_fasta(df, cfg.promoter_fasta, short_header=False)
     _write_fasta(df, cfg.promoter_fasta_short, short_header=True)
+
+    if cfg.cds_bp > 0:
+        contigs = _load_contigs(cfg.input_fasta)
+        df = _add_cds_column(df, contigs, cfg.cds_bp)
+        _write_fasta_cds(df, cfg.promoter_cds_fasta, short_header=False)
+        _write_fasta_cds(df, cfg.promoter_cds_fasta_short, short_header=True)
+
     print("  Step 8 complete.\n")
 
 
@@ -580,41 +664,162 @@ def step09_extract_all_promoters(cfg: Config, force: bool = False):
 
     _write_fasta(df, cfg.all_promoter_fasta, short_header=False)
     _write_fasta(df, cfg.all_promoter_fasta_short, short_header=True)
+
+    if cfg.cds_bp > 0:
+        contigs = _load_contigs(cfg.input_fasta)
+        df = _add_cds_column(df, contigs, cfg.cds_bp)
+        _write_fasta_cds(df, cfg.all_promoter_cds_fasta, short_header=False)
+        _write_fasta_cds(df, cfg.all_promoter_cds_fasta_short, short_header=True)
+
     print("  Step 9 complete.\n")
 
 
 # =====================================================================
-#  Step 10 — PromoterLCNN prediction (final filter)
+#  Step 10 — Promoter prediction (final filter)
+#
+#  Bacteria  → PromoterLCNN  (two-stage: binary + σ-factor subtype)
+#  Archaea   → iProm-Archaea (single-stage: binary only)
 # =====================================================================
 
-def step10_predict_promoters(cfg: Config, force: bool = False):
-    """Run PromoterLCNN on ALL promoter-orientation IGRs.
-
-    Each sequence is trimmed to its 3'-terminal 81 nt (closest to the
-    transcription start site) before prediction.  The step writes:
-
-    * ``lcnn_predictions.tsv`` — per-sequence predictions for every
-      promoter-orientation IGR.
-    * ``promoter_markers_verified.tsv`` — subset of marker promoters
-      that PromoterLCNN also classifies as promoters (used by the HTML
-      report and downstream annotation steps).
-    """
-    if not force and cfg.lcnn_predictions.exists() and cfg.promoter_markers_verified.exists():
-        print("── PromoterLCNN predictions already exist, skipping ──")
-        print("  Step 10 complete.\n")
-        return
+def _step10_bacteria(cfg: Config, all_igr, force: bool = False):
+    """PromoterLCNN path — bacterial σ-factor classification."""
 
     # Check weights availability
     if cfg.lcnn_weights_dir is None or not cfg.lcnn_weights_dir.is_dir():
         print("── PromoterLCNN weights not available, skipping prediction ──")
         print("  Provide --lcnn-weights or reinstall to restore bundled weights.")
-        # Write empty predictions; pass-through markers as-is
         if cfg.igr_summary.exists():
             pd.DataFrame(columns=["igr_id", "prediction", "sigma_type"]).to_csv(
                 cfg.lcnn_predictions, sep="\t", index=False)
         if cfg.promoter_markers.exists():
             import shutil
             shutil.copy2(cfg.promoter_markers, cfg.promoter_markers_verified)
+        return
+
+    # Trim to 3'-terminal 81 nt (closest to TSS / CDS start)
+    _LCNN_LEN = 81
+    seqs_81 = []
+    short_mask = []
+    for seq in all_igr["sequence_5p_to_3p"]:
+        if len(seq) >= _LCNN_LEN:
+            seqs_81.append(seq[-_LCNN_LEN:])
+            short_mask.append(False)
+        else:
+            seqs_81.append(None)
+            short_mask.append(True)
+
+    n_short = sum(short_mask)
+    if n_short:
+        print(f"  {n_short} sequence(s) shorter than {_LCNN_LEN} nt — "
+              f"classified as NON_PROMOTER")
+
+    from .promoter_lcnn import load_models, predict as lcnn_predict, PromoterType
+
+    n_valid = len(seqs_81) - n_short
+    print(f"── Running PromoterLCNN on {n_valid} sequences ──")
+    models = load_models(
+        cfg.lcnn_weights_dir / "IsPromoter_fold_5",
+        cfg.lcnn_weights_dir / "PromotersOnly_fold_1",
+    )
+
+    valid_seqs = [s for s in seqs_81 if s is not None]
+    preds = lcnn_predict(models, valid_seqs) if valid_seqs else []
+
+    # Merge predictions back, filling short sequences as NON_PROMOTER
+    full_preds = []
+    pred_iter = iter(preds)
+    for is_short in short_mask:
+        if is_short:
+            full_preds.append(PromoterType.NON_PROMOTER)
+        else:
+            full_preds.append(next(pred_iter))
+
+    # Build predictions table
+    pred_rows = []
+    for i, (_, row) in enumerate(all_igr.iterrows()):
+        pt = full_preds[i]
+        pred_rows.append({
+            "igr_id": row["igr_id"],
+            "prediction": "PROMOTER" if pt != PromoterType.NON_PROMOTER else "NON_PROMOTER",
+            "sigma_type": pt.name,
+        })
+
+    return pred_rows
+
+
+def _step10_archaea(cfg: Config, all_igr, force: bool = False):
+    """iProm-Archaea path — binary archaeal promoter classification."""
+
+    # Check weights availability
+    if cfg.ipromarchaea_weights is None or not cfg.ipromarchaea_weights.exists():
+        print("── iProm-Archaea weights not available, skipping prediction ──")
+        print("  Provide --ipromarchaea-weights or reinstall to restore bundled weights.")
+        if cfg.igr_summary.exists():
+            pd.DataFrame(columns=["igr_id", "prediction", "sigma_type"]).to_csv(
+                cfg.lcnn_predictions, sep="\t", index=False)
+        if cfg.promoter_markers.exists():
+            import shutil
+            shutil.copy2(cfg.promoter_markers, cfg.promoter_markers_verified)
+        return
+
+    # iProm-Archaea scans sequences in non-overlapping 100 bp windows,
+    # classifying each window independently.  A sequence is called a
+    # promoter if ANY window scores positive.  Windows shorter than
+    # 80 bp are discarded, so sequences < 80 bp produce no windows and
+    # are classified as non-promoters.  The windowing and any-positive
+    # aggregation are handled inside arch_predict().
+    from .promoter_ipromarchaea import load_model, predict as arch_predict
+
+    # Sequences < 80 nt will yield no windows inside predict(), but we
+    # count them here for the log message.
+    _ARCHAEA_MIN = 80
+    n_short = sum(1 for seq in all_igr["sequence_5p_to_3p"] if len(seq) < _ARCHAEA_MIN)
+    if n_short:
+        print(f"  {n_short} sequence(s) shorter than {_ARCHAEA_MIN} nt — "
+              f"classified as NON_PROMOTER (no valid windows)")
+
+    seqs = list(all_igr["sequence_5p_to_3p"])
+    print(f"── Running iProm-Archaea on {len(seqs)} sequences "
+          f"(sliding 100 bp windows) ──")
+    model = load_model(cfg.ipromarchaea_weights)
+
+    full_preds = arch_predict(model, seqs)
+
+    # Build predictions table.  For archaea there are no sigma subtypes,
+    # so sigma_type is "PROMOTER" or "NON_PROMOTER" to stay consistent
+    # with the downstream column expectations.
+    pred_rows = []
+    for i, (_, row) in enumerate(all_igr.iterrows()):
+        is_prom = full_preds[i]
+        pred_rows.append({
+            "igr_id": row["igr_id"],
+            "prediction": "PROMOTER" if is_prom else "NON_PROMOTER",
+            "sigma_type": "PROMOTER" if is_prom else "NON_PROMOTER",
+        })
+
+    return pred_rows
+
+
+def step10_predict_promoters(cfg: Config, force: bool = False):
+    """Run promoter prediction on ALL promoter-orientation IGRs.
+
+    For bacteria, each sequence is trimmed to its 3'-terminal 81 nt and
+    classified by PromoterLCNN (binary + σ-factor subtype).
+
+    For archaea, each sequence is trimmed to its 3'-terminal 100 nt and
+    classified by iProm-Archaea (binary promoter/non-promoter only).
+
+    The step writes:
+
+    * ``lcnn_predictions.tsv`` — per-sequence predictions for every
+      promoter-orientation IGR.
+    * ``promoter_markers_verified.tsv`` — subset of marker promoters
+      confirmed by the CNN (used by the HTML report and downstream
+      annotation steps).
+    """
+    if not force and cfg.lcnn_predictions.exists() and cfg.promoter_markers_verified.exists():
+        classifier = "iProm-Archaea" if cfg.is_archaea else "PromoterLCNN"
+        print(f"── {classifier} predictions already exist, skipping ──")
         print("  Step 10 complete.\n")
         return
 
@@ -640,67 +845,26 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
         axis=1,
     )
 
-    # Trim to 3'-terminal 81 nt (closest to TSS / CDS start)
-    _LCNN_LEN = 81
-    seqs_81 = []
-    short_mask = []
-    for seq in all_igr["sequence_5p_to_3p"]:
-        if len(seq) >= _LCNN_LEN:
-            seqs_81.append(seq[-_LCNN_LEN:])
-            short_mask.append(False)
-        else:
-            seqs_81.append(None)
-            short_mask.append(True)
-
-    n_short = sum(short_mask)
-    if n_short:
-        print(f"  {n_short} sequence(s) shorter than {_LCNN_LEN} nt — "
-              f"classified as NON_PROMOTER")
-
-    # Load models and predict
-    from .promoter_lcnn import load_models, predict as lcnn_predict, PromoterType
-
-    n_valid = len(seqs_81) - n_short
-    print(f"── Running PromoterLCNN on {n_valid} sequences ──")
-    models = load_models(
-        cfg.lcnn_weights_dir / "IsPromoter_fold_5",
-        cfg.lcnn_weights_dir / "PromotersOnly_fold_1",
-    )
-
-    valid_seqs = [s for s in seqs_81 if s is not None]
-    if valid_seqs:
-        preds = lcnn_predict(models, valid_seqs)
+    # Dispatch to domain-specific classifier
+    if cfg.is_archaea:
+        pred_rows = _step10_archaea(cfg, all_igr, force=force)
     else:
-        preds = []
+        pred_rows = _step10_bacteria(cfg, all_igr, force=force)
 
-    # Merge predictions back, filling short sequences as NON_PROMOTER
-    full_preds = []
-    pred_iter = iter(preds)
-    for is_short in short_mask:
-        if is_short:
-            full_preds.append(PromoterType.NON_PROMOTER)
-        else:
-            full_preds.append(next(pred_iter))
-
-    # Build predictions table for ALL promoter-orientation IGRs
-    pred_rows = []
-    for i, (_, row) in enumerate(all_igr.iterrows()):
-        pt = full_preds[i]
-        pred_rows.append({
-            "igr_id": row["igr_id"],
-            "prediction": "PROMOTER" if pt != PromoterType.NON_PROMOTER else "NON_PROMOTER",
-            "sigma_type": pt.name,
-        })
+    if pred_rows is None:
+        # Weights were missing; helper already wrote fallback files.
+        print("  Step 10 complete.\n")
+        return
 
     pred_df = pd.DataFrame(pred_rows)
     pred_df.to_csv(cfg.lcnn_predictions, sep="\t", index=False)
 
-    n_promoter = sum(1 for p in full_preds if p != PromoterType.NON_PROMOTER)
-    n_non = len(full_preds) - n_promoter
+    n_promoter = sum(1 for r in pred_rows if r["prediction"] == "PROMOTER")
+    n_non = len(pred_rows) - n_promoter
     print(f"  Predicted: {n_promoter} promoter(s), {n_non} non-promoter(s)")
     print(f"  Predictions -> {cfg.lcnn_predictions}")
 
-    # Write verified markers: intersection of marker promoters and LCNN-positive
+    # Write verified markers: intersection of marker promoters and CNN-positive
     marker_igr_ids = set()
     try:
         markers_df = pd.read_csv(cfg.promoter_markers, sep="\t")
@@ -709,8 +873,8 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
 
-    lcnn_positive = set(r["igr_id"] for r in pred_rows if r["prediction"] == "PROMOTER")
-    verified_ids = marker_igr_ids & lcnn_positive
+    cnn_positive = set(r["igr_id"] for r in pred_rows if r["prediction"] == "PROMOTER")
+    verified_ids = marker_igr_ids & cnn_positive
 
     sigma_map = {r["igr_id"]: r["sigma_type"] for r in pred_rows}
 
@@ -1001,7 +1165,7 @@ def step14_generate_report(cfg: Config, force: bool = False):
 
     print("── Generating HTML report ──")
 
-    # Load verified promoters (after PromoterLCNN filter).
+    # Load verified promoters (after CNN filter).
     # Falls back to promoter_markers if verified file doesn't exist.
     source_file = cfg.promoter_markers_verified if cfg.promoter_markers_verified.exists() else cfg.promoter_markers
     promoter_df = None
@@ -1019,11 +1183,13 @@ def step14_generate_report(cfg: Config, force: bool = False):
         print("  Step 14 complete.\n")
         return
 
-    # Filter to σ70 promoters only
-    if "sigma_type" in promoter_df.columns:
+    # For bacteria, filter to σ70 promoters only.
+    # For archaea, keep all CNN-confirmed promoters (no sigma subtypes).
+    if not cfg.is_archaea and "sigma_type" in promoter_df.columns:
         promoter_df = promoter_df[promoter_df["sigma_type"] == "SIGMA_70"].copy()
     if promoter_df.empty:
-        print("  No σ70 promoters found for report.")
+        label = "promoters" if cfg.is_archaea else "σ70 promoters"
+        print(f"  No {label} found for report.")
         print("  Step 14 complete.\n")
         return
 
@@ -1115,6 +1281,12 @@ def step14_generate_report(cfg: Config, force: bool = False):
     promoters_fasta_name = cfg.promoter_fasta.name if cfg.promoter_fasta.exists() else ""
     final_table_name = cfg.final_table.name if cfg.final_table.exists() else ""
 
+    # Domain-aware labels
+    promoter_type_label = "promoters" if cfg.is_archaea else "σ70 promoters"
+    promoter_type_html = "promoters" if cfg.is_archaea else "&sigma;70 promoters"
+    classifier_name = "iProm-Archaea" if cfg.is_archaea else "PromoterLCNN"
+    domain_label = "Archaea" if cfg.is_archaea else "Bacteria"
+
     html_parts = [_REPORT_HTML_HEAD.format(
         genome_name=html_mod.escape(genome_name),
         n_marker_promoters=n_promoters,
@@ -1126,6 +1298,10 @@ def step14_generate_report(cfg: Config, force: bool = False):
         verified_tsv=html_mod.escape(verified_tsv_name),
         promoters_fasta=html_mod.escape(promoters_fasta_name),
         final_table=html_mod.escape(final_table_name),
+        promoter_type_html=promoter_type_html,
+        promoter_type_label=promoter_type_label,
+        classifier_name=classifier_name,
+        domain_label=domain_label,
     )]
 
     # Legend
@@ -1139,7 +1315,8 @@ def step14_generate_report(cfg: Config, force: bool = False):
     """)
 
     # Table
-    html_parts.append("""
+    sigma_col_header = "Classification" if cfg.is_archaea else "Sigma type"
+    html_parts.append(f"""
     <table>
     <thead>
     <tr>
@@ -1148,7 +1325,7 @@ def step14_generate_report(cfg: Config, force: bool = False):
         <th>Position</th>
         <th>Length</th>
         <th>Orientation</th>
-        <th>Sigma type</th>
+        <th>{sigma_col_header}</th>
         <th>Associated CDS</th>
         <th>Protein</th>
         <th>Sequence diagram</th>
@@ -1268,7 +1445,7 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 <p style="color:#666; margin-bottom:4px;">Genome: <strong>{genome_name}</strong></p>
 
 <div class="summary">
-    <div class="stat"><div class="label">&sigma;70 promoters</div><div class="value">{n_marker_promoters}</div></div>
+    <div class="stat"><div class="label">{promoter_type_html}</div><div class="value">{n_marker_promoters}</div></div>
     <div class="stat"><div class="label">CDS annotated</div><div class="value">{n_annotated}</div></div>
     <div class="stat"><div class="label">With motif hits</div><div class="value">{n_with_motifs}</div></div>
     <div class="stat"><div class="label">Total motif hits</div><div class="value">{total_fimo}</div></div>
@@ -1276,7 +1453,8 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 </div>
 
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
-    This report shows the <strong>{n_marker_promoters}</strong> &sigma;70 promoters (marker-filtered, CNN-confirmed, &sigma;70 only).
+    Domain: <strong>{domain_label}</strong> · Classifier: <strong>{classifier_name}</strong><br/>
+    This report shows the <strong>{n_marker_promoters}</strong> {promoter_type_label} (marker-filtered, CNN-confirmed).
     A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome.
 </p>
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
@@ -1287,7 +1465,7 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
     <a href="{final_table}">profinder_results.tsv</a>
 </p>
 
-<h2>&sigma;70 promoters</h2>
+<h2>{promoter_type_html}</h2>
 """
 
 _REPORT_HTML_FOOT = """
@@ -1433,13 +1611,21 @@ def step13_final_table(cfg: Config, force: bool = False):
 
     igr["motif_hits"] = igr["igr_id"].map(lambda g: fimo_summary.get(g, ""))
 
-    # 8. Select and order final columns
-    out = igr[[
+    # 8. CDS-extended sequences (optional)
+    columns = [
         "igr_id", "contig", "start", "end", "length", "orientation",
         "associated_cds", "gene_name", "locus_tag", "product",
         "is_marker", "lcnn_prediction", "sigma_type",
         "motif_hits", "sequence_5p_to_3p",
-    ]].copy()
+    ]
+
+    if cfg.cds_bp > 0:
+        contigs = _load_contigs(cfg.input_fasta)
+        igr = _add_cds_column(igr, contigs, cfg.cds_bp)
+        columns.append("sequence_5p_to_3p_cds")
+
+    # 9. Select and order final columns
+    out = igr[columns].copy()
     out.rename(columns={"igr_id": "promoter_id"}, inplace=True)
 
     out.to_csv(cfg.final_table, sep="\t", index=False)
@@ -1457,7 +1643,7 @@ STEPS = [
     (7,  "Match IGRs to marker operons",     step07_match_igrs_to_markers),
     (8,  "Extract marker promoters",         step08_extract_marker_promoters),
     (9,  "Extract all promoters",            step09_extract_all_promoters),
-    (10, "Predict promoters (PromoterLCNN)", step10_predict_promoters),
+    (10, "Predict promoters (CNN classifier)", step10_predict_promoters),
     (11, "Annotate CDS (Prokka)",            step11_annotate_cds),
     (12, "Scan motifs (FIMO)",               step12_run_fimo),
     (13, "Build final output table",         step13_final_table),
@@ -1467,13 +1653,19 @@ STEPS = [
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ProFinder — bacterial promoter identification pipeline",
+        description="ProFinder — bacterial and archaeal promoter identification pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-i", "--input", type=Path, required="--list" not in sys.argv,
                         help="Input genome FASTA file")
     parser.add_argument("-o", "--output", type=Path, default=Path("output"),
                         help="Output directory (default: output/)")
+    parser.add_argument("--domain", choices=["bacteria", "archaea"],
+                        default="bacteria",
+                        help="Target domain: 'bacteria' uses PromoterLCNN "
+                             "(σ-factor classification); 'archaea' uses "
+                             "iProm-Archaea (binary promoter/non-promoter). "
+                             "Default: bacteria")
     parser.add_argument("--start", type=int, default=1,
                         help="First step to run (default: 1)")
     parser.add_argument("--end", type=int, default=max(s[0] for s in STEPS),
@@ -1493,10 +1685,15 @@ def main():
     parser.add_argument("--pfam", type=Path, default=None,
                         help="Path to Pfam-A HMM database (default: bundled)")
 
-    # PromoterLCNN
+    # PromoterLCNN (bacteria)
     parser.add_argument("--lcnn-weights", type=Path, default=None,
                         help="Directory containing PromoterLCNN SavedModel "
                              "subdirectories (default: bundled weights/)")
+
+    # iProm-Archaea (archaea)
+    parser.add_argument("--ipromarchaea-weights", type=Path, default=None,
+                        help="Path to iProm-Archaea .h5 weights file "
+                             "(default: bundled weights/iPromArchaea/)")
 
     # FIMO / motifs
     parser.add_argument("--fimo", default="fimo",
@@ -1532,6 +1729,10 @@ def main():
                         help="Min flanking distance for operon boundaries (default: 75)")
     parser.add_argument("--hmm-bitscore", type=float, default=25.0,
                         help="Minimum HMM bitscore (default: 25.0)")
+    parser.add_argument("--cds-bp", type=int, default=0,
+                        help="Number of CDS-start nucleotides to append to "
+                             "promoter sequences in additional FASTA outputs "
+                             "and the final table. 0 = disabled (default: 0)")
 
     args = parser.parse_args()
 
@@ -1543,20 +1744,28 @@ def main():
     if not args.input.exists():
         sys.exit(f"Input file not found: {args.input}")
 
+    # When running in archaea mode, default Prokka kingdom to Archaea
+    # unless the user explicitly provided --kingdom.
+    kingdom = args.kingdom
+    if args.domain == "archaea" and kingdom == "Bacteria":
+        kingdom = "Archaea"
+
     cfg = Config(
         input_fasta=args.input.resolve(),
         output_dir=args.output.resolve(),
+        domain=args.domain,
         prokka_bin=args.prokka,
         hmmsearch_bin=args.hmmsearch,
         fimo_bin=args.fimo,
         tigrfam_hmm=args.tigrfam,
         pfam_hmm=args.pfam,
         lcnn_weights_dir=args.lcnn_weights,
+        ipromarchaea_weights=args.ipromarchaea_weights,
         conda_env_prokka=args.conda_prokka,
         conda_env_hmm=args.conda_hmm,
         conda_env_meme=args.conda_meme,
         threads=args.threads,
-        prokka_kingdom=args.kingdom,
+        prokka_kingdom=kingdom,
         prokka_prefix=args.prefix,
         igr_size_min=args.igr_min,
         igr_size_max=args.igr_max,
@@ -1565,6 +1774,7 @@ def main():
         hmm_bitscore_min=args.hmm_bitscore,
         motifs_dir=args.motifs_dir,
         fimo_threshold=args.fimo_threshold,
+        cds_bp=args.cds_bp,
     )
     cfg.ensure_dirs()
 
