@@ -62,100 +62,112 @@ def _encode_sequences(seqs: List[str]) -> np.ndarray:
 
 # ── Model loading ──────────────────────────────────────────────────
 
-def _patch_user_object_for_optimizer(tf):
-    """Monkey-patch ``_UserObject`` so ``tf.saved_model.load()`` can skip
-    over tensorflow-addons optimizer state that Keras 3 / TF 2.16+
-    cannot deserialize.
+class _V1SessionModel:
+    """Wraps a TF 1.x Session + SavedModel serving signature as a
+    callable that behaves like a Keras model for inference.
 
-    The patch adds a no-op ``add_slot`` (and a few related helpers) so
-    the loader silently absorbs the optimizer checkpoint variables
-    instead of crashing with ``AttributeError: '_UserObject' object has
-    no attribute 'add_slot'``.
-
-    The patch is applied once and is idempotent.
+    This is the most robust loader for legacy SavedModels that contain
+    tensorflow-addons optimizer state.  The v1 loader treats the
+    optimizer as opaque graph nodes and never tries to reconstruct
+    Python optimizer objects, so it doesn't hit the ``add_slot``
+    ``AttributeError`` that breaks both ``TFSMLayer`` and
+    ``tf.saved_model.load()`` in TF 2.16+ / Keras 3.
     """
-    try:
-        from tensorflow.python.saved_model.load import _UserObject
-    except ImportError:
-        return  # older TF, patch not needed
 
-    if hasattr(_UserObject, "_patched_for_promoter_lcnn"):
-        return  # already patched
+    def __init__(self, sess, input_tensor_name, output_tensor_name):
+        self._sess = sess
+        self._input_name = input_tensor_name
+        self._output_name = output_tensor_name
+        # Keep graph + session alive for the lifetime of this object.
+        self._graph = sess.graph
 
-    def _noop_add_slot(self, var, slot_name, initializer="zeros"):
-        """No-op: discard optimizer slot variables during loading."""
-        import tensorflow as _tf
-        return _tf.Variable(0.0, trainable=False, name=f"discarded/{slot_name}")
+    def __call__(self, x):
+        if hasattr(x, "numpy"):
+            x = x.numpy()
+        return self._sess.run(self._output_name, {self._input_name: x})
 
-    _UserObject.add_slot = _noop_add_slot
 
-    # Some optimizer checkpoints also reference .iterations or .lr
-    if not hasattr(_UserObject, "iterations"):
-        _UserObject.iterations = property(
-            lambda self: tf.Variable(0, trainable=False, dtype=tf.int64)
+def _load_via_v1_session(path, tf):
+    """Load a SavedModel using the TF 1.x Session-based API.
+
+    Returns a :class:`_V1SessionModel` whose ``__call__`` accepts a
+    numpy array / tensor and returns a numpy array, matching the
+    interface expected by :func:`_run_inference`.
+    """
+    graph = tf.Graph()
+    sess = tf.compat.v1.Session(graph=graph)
+    with graph.as_default():
+        meta_graph = tf.compat.v1.saved_model.loader.load(
+            sess, [tf.saved_model.SERVING], str(path),
         )
-
-    _UserObject._patched_for_promoter_lcnn = True
+    sig = meta_graph.signature_def["serving_default"]
+    input_name = list(sig.inputs.values())[0].name
+    output_name = list(sig.outputs.values())[0].name
+    return _V1SessionModel(sess, input_name, output_name)
 
 
 def _load_saved_model(path, tf):
-    """Load a TensorFlow SavedModel directory, handling both Keras 2 and
-    Keras 3 (TensorFlow ≥ 2.16).
+    """Load a TensorFlow SavedModel directory, handling Keras 2,
+    Keras 3 (TF >= 2.16), and legacy SavedModels with optimizer state
+    from tensorflow-addons.
 
-    Three strategies are tried in order:
+    Four strategies are tried in order:
 
     1. ``tf.keras.models.load_model()`` — works on TF < 2.16.
     2. ``TFSMLayer`` — works on Keras 3 when the SavedModel has no
        problematic optimizer state.
-    3. ``tf.saved_model.load()`` with a monkey-patched ``_UserObject``
-       so tensorflow-addons optimizer state is silently discarded.
-       The serving signature is then extracted for inference.
+    3. ``tf.saved_model.load()`` — works when the SavedModel has no
+       optimizer state (extracts the serving signature).
+    4. ``tf.compat.v1.saved_model.loader.load()`` — Session-based
+       loading that completely avoids Python optimizer reconstruction.
+       This is the catch-all for SavedModels trained with
+       tensorflow-addons optimisers.
     """
+    path_str = str(path)
+
     # --- Attempt 1: Keras 2-style load (works on TF < 2.16) -----------
     try:
-        return tf.keras.models.load_model(str(path), compile=False)
-    except (ValueError, TypeError):
+        return tf.keras.models.load_model(path_str, compile=False)
+    except (ValueError, TypeError, Exception):
+        # Broad catch: Keras 3 raises various errors for legacy
+        # SavedModel directories.
         pass
 
     # --- Attempt 2: TFSMLayer (Keras 3, clean SavedModels) ------------
     try:
         return tf.keras.layers.TFSMLayer(
-            str(path), call_endpoint="serving_default"
+            path_str, call_endpoint="serving_default"
         )
-    except (AttributeError, ValueError, TypeError):
+    except Exception:
         pass
 
-    # --- Attempt 3: patch + raw saved_model.load ----------------------
-    _patch_user_object_for_optimizer(tf)
-    obj = tf.saved_model.load(str(path))
-    if hasattr(obj, "signatures") and "serving_default" in obj.signatures:
-        return obj.signatures["serving_default"]
-    if callable(obj):
-        return obj
-    raise RuntimeError(
-        f"Cannot load SavedModel at {path}: no usable serving "
-        f"signature or callable found after all loading strategies "
-        f"were exhausted."
-    )
+    # --- Attempt 3: raw tf.saved_model.load ---------------------------
+    try:
+        obj = tf.saved_model.load(path_str)
+        if hasattr(obj, "signatures") and "serving_default" in obj.signatures:
+            return obj.signatures["serving_default"]
+        if callable(obj):
+            return obj
+    except Exception:
+        pass
+
+    # --- Attempt 4: TF 1.x Session-based loader (most robust) --------
+    return _load_via_v1_session(path, tf)
 
 
-# ── Public API ──────────────────────────────────────────────────────
-def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
-    """Load the two SavedModel directories and return a (model1, model2) tuple.
+def _suppress_tf_logging():
+    """Suppress TensorFlow's C++ and Python logging noise.
 
-    Lazy-imports TensorFlow so that modules that don't call this function
-    never pay the import cost.  Works with both Keras 2
-    (``tf.keras.models.load_model``) and Keras 3 / TF ≥ 2.16
-    (``TFSMLayer`` fallback for legacy SavedModel directories).
+    Sets environment variables, configures Python loggers, and
+    temporarily redirects stderr during ``import tensorflow`` to
+    swallow the ``absl::InitializeLog`` and ``cudart_stub`` messages
+    that are emitted by the C++ runtime before any Python-level
+    logging is active.
     """
     import os
-    # Suppress TensorFlow C++ runtime logs (CUDA probing, TensorRT,
-    # oneDNN, absl warnings) BEFORE importing TF.  Level 3 = FATAL only.
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-    # Suppress absl logging that leaks through before TF's own logger
-    # is configured (the "All log messages before absl::InitializeLog()"
-    # warnings and cudart_stub notices).
+
     import logging
     logging.getLogger("tensorflow").setLevel(logging.ERROR)
     try:
@@ -164,8 +176,46 @@ def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
         logging.getLogger("absl").setLevel(logging.ERROR)
     except ImportError:
         pass
-    import tensorflow as tf  # noqa: delayed import
+
+
+def _import_tf_quietly():
+    """Import TensorFlow while suppressing C++ stderr noise.
+
+    The ``absl::InitializeLog()`` and ``cudart_stub.cc`` messages are
+    written to stderr by the C++ runtime the instant the TF shared
+    library is loaded, before any Python logger exists.  The only way
+    to hide them is to redirect ``sys.stderr`` (file descriptor 2)
+    during the import.
+    """
+    _suppress_tf_logging()
+
+    import sys
+    import os
+
+    # Redirect fd 2 (C stderr) to /dev/null for the duration of import.
+    _orig_fd = os.dup(2)
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 2)
+    try:
+        import tensorflow as tf
+    finally:
+        os.dup2(_orig_fd, 2)
+        os.close(_orig_fd)
+        os.close(_devnull)
+
     tf.get_logger().setLevel("ERROR")
+    return tf
+
+
+# ── Public API ──────────────────────────────────────────────────────
+def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
+    """Load the two SavedModel directories and return a (model1, model2) tuple.
+
+    Lazy-imports TensorFlow so that modules that don't call this function
+    never pay the import cost.  Works with Keras 2, Keras 3 / TF >= 2.16,
+    and legacy SavedModels containing tensorflow-addons optimizer state.
+    """
+    tf = _import_tf_quietly()
 
     model1 = _load_saved_model(is_promoter_dir, tf)
     model2 = _load_saved_model(promoters_only_dir, tf)
@@ -175,26 +225,24 @@ def load_models(is_promoter_dir: Path, promoters_only_dir: Path):
 def _run_inference(model, encoded: np.ndarray) -> np.ndarray:
     """Run a forward pass, normalising the output to a plain ndarray.
 
-    Handles three loader flavours:
+    Handles four loader flavours:
 
-    * Keras ``Model`` (from ``load_model``) — call directly, returns
-      ndarray or tensor.
+    * Keras ``Model`` — call directly, returns ndarray or tensor.
     * ``TFSMLayer`` — call directly, returns a dict of tensors.
-    * ``ConcreteFunction`` (from ``tf.saved_model.load().signatures``)
-      — must be called with **keyword** arguments and returns a dict
-      of tensors.
+    * ``ConcreteFunction`` (from ``signatures["serving_default"]``)
+      — keyword arguments, returns a dict of tensors.
+    * ``_V1SessionModel`` — takes a numpy array, returns a numpy array.
     """
+    # _V1SessionModel already accepts numpy and returns numpy.
+    if isinstance(model, _V1SessionModel):
+        return np.asarray(model(encoded))
+
     import tensorflow as tf
 
     tensor_in = tf.constant(encoded)
 
-    # ConcreteFunction (from signatures dict) expects keyword args.
-    # Its structured_input_signature tells us the expected key name,
-    # but the most reliable approach is to inspect the function's
-    # argument names.
+    # ConcreteFunction expects keyword args.
     if hasattr(model, "structured_input_signature"):
-        # It's a ConcreteFunction — get the keyword name from its
-        # input signature (second element is the kwargs dict).
         _, kwarg_spec = model.structured_input_signature
         if kwarg_spec:
             key = next(iter(kwarg_spec))
