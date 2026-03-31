@@ -12,18 +12,6 @@ ProFinder is not a genome-wide promoter annotation tool. It applies a series of 
 
 The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions between annotated CDS features, identifies operons using a two-pass proximity/flanking-distance algorithm, and screens for marker genes via hmmsearch against TIGRfam and Pfam (profiles are bundled). Candidate promoters are then classified by the domain-appropriate CNN. Promoters are scanned for transcription factor binding motifs with FIMO, and a visual HTML report is generated.
 
-## Bacteria vs. archaea
-
-The `--domain` flag controls which promoter classifier is used.
-
-`--domain bacteria` (the default) runs [PromoterLCNN](https://github.com/occasumlux/Promoters), a two-stage CNN trained on experimentally verified *E. coli* K-12 promoters from RegulonDB. Stage 1 separates promoters from non-promoters. Stage 2 assigns a sigma-factor subtype (σ70, σ24, σ28, σ32, σ38, σ54). Only the 3'-terminal 81 nt of each intergenic region (closest to the transcription start site) is classified. The HTML report filters to σ70 promoters.
-
-`--domain archaea` runs [iProm-Archaea](https://github.com/PromoterTools/iPromArchaea), a CNN that uses 6-mer frequency encoding to perform binary promoter/non-promoter classification. Archaea lack bacterial sigma factors, so there is no subtype assignment. Each intergenic region is scanned in non-overlapping 100 bp windows from 5' to 3', matching the original tool's design. An IGR is called a promoter if any window scores positive. This means longer intergenic regions are fully scanned rather than truncated to a fixed-length suffix.
-
-When `--domain archaea` is specified, Prokka's `--kingdom` is automatically set to `Archaea` (override with `--kingdom` if needed).
-
-All other pipeline steps (Prokka annotation, IGR extraction, operon identification, HMM marker screening, FIMO motif scanning, report generation) run identically for both domains.
-
 ## Why an *E. coli*-trained classifier works across bacterial species
 
 PromoterLCNN was trained on *E. coli* K-12 σ70 promoters, but the core recognition logic (the −10 TATAAT and −35 TTGACA hexamers, the 17 ± 1 bp spacer, the AT-rich upstream element) is conserved across bacteria. In benchmarking across eleven species spanning seven phyla, ProFinder returned useful promoter shortlists (13 to 33 σ70 marker promoters) for every species with intergenic GC content below 50%, including organisms as distant from *E. coli* as *Bacillus subtilis* (Firmicutes), *Synechocystis* sp. PCC 6803 (Cyanobacteria), and *Vibrio cholerae* (Vibrionaceae).
@@ -32,27 +20,76 @@ For organisms with intergenic GC content above approximately 60% (*Pseudomonas a
 
 ## Requirements
 
-**Python ≥ 3.7** with pandas ≥ 1.3, biopython ≥ 1.79, and tensorflow ≥ 2.6.
-
-**External tools** (must be on `$PATH` or specified via CLI flags):
-
-- [Prokka](https://github.com/tseemann/prokka)
-- [MEME Suite](https://meme-suite.org/) (specifically `fimo`)
-- [HMMER](http://hmmer.org/)
-
-HMM profiles, motif databases, and CNN weights for both classifiers are bundled with the pipeline.
+ProFinder needs Python ≥ 3.9, TensorFlow ≥ 2.6, and three bioinformatics tools: Prokka, HMMER, and the MEME Suite (specifically `fimo`). HMM profiles, motif databases, and CNN weights for both classifiers are bundled with the package — nothing else needs to be downloaded.
 
 ## Installation
 
+The instructions below create a self-contained conda environment with every dependency. No additional software is required beyond conda (or mamba) itself.
+
+**1. Create the environment and install bioinformatics tools**
+
 ```bash
+conda create -n profinder -c bioconda -c conda-forge \
+    python=3.12 prokka hmmer meme pip -y
+conda activate profinder
+```
+
+This installs Prokka, hmmsearch, and fimo from bioconda, along with Python 3.12 and pip from conda-forge. Python 3.12 is recommended because TensorFlow ≥ 2.16 has the best support for it; 3.9–3.11 also work.
+
+**2. Clone and install ProFinder**
+
+```bash
+git clone https://github.com/jmarsh/profinder.git
+cd profinder
 pip install .
 ```
 
-Or for development:
+This pulls in the Python dependencies (pandas, biopython, tensorflow) via pip and registers the `profinder` command. All bundled data (HMM databases, motif files, CNN weights) is installed as package data alongside the Python modules.
+
+For development (editable install):
 
 ```bash
 pip install -e .
 ```
+
+**3. Verify the installation**
+
+```bash
+profinder --list          # prints the 14 pipeline steps
+prokka --version          # should print version ≥ 1.14
+hmmsearch -h | head -1    # should print HMMER version
+fimo --version            # should print MEME Suite version
+```
+
+**Troubleshooting: TensorFlow version conflicts**
+
+If conda's solver pulls an older Python (< 3.9) to satisfy Prokka's dependencies, TensorFlow may fail to install or run correctly. Pin Python explicitly as shown above (`python=3.12`). If you see Keras 3 / SavedModel loading errors, make sure your TensorFlow version is ≥ 2.16 — the pipeline includes compatibility shims for the Keras 2 → Keras 3 transition, but versions between 2.12 and 2.15 are the least tested.
+
+**Alternative: separate conda environments for each tool**
+
+If you prefer isolation (or if bioconda's Prokka conflicts with TensorFlow in a single environment), install each tool in its own environment and point ProFinder at them:
+
+```bash
+# Tool environments
+conda create -n prokka_env -c bioconda -c conda-forge prokka -y
+conda create -n hmmer_env  -c bioconda -c conda-forge hmmer -y
+conda create -n meme_env   -c bioconda -c conda-forge meme -y
+
+# ProFinder environment (Python + TensorFlow only)
+conda create -n profinder -c conda-forge python=3.12 pip -y
+conda activate profinder
+git clone https://github.com/jmarsh/profinder.git
+cd profinder
+pip install .
+
+# Run with --conda-* flags
+profinder -i genome.fasta -o results/ \
+    --conda-prokka prokka_env \
+    --conda-hmm hmmer_env \
+    --conda-meme meme_env
+```
+
+The `--conda-prokka`, `--conda-hmm`, and `--conda-meme` flags activate the named environment before calling each tool, so the main profinder environment only needs Python and TensorFlow.
 
 ## Quick start
 
