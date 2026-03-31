@@ -1652,6 +1652,15 @@ STEPS = [
 
 
 def main():
+    # Suppress TensorFlow C++ runtime warnings (CUDA probing, oneDNN,
+    # cudart_stub, TensorRT, etc.) BEFORE any TF import can happen.
+    # Level 3 = FATAL only; these must be set before the C++ runtime
+    # initialises, which happens at the first ``import tensorflow``.
+    import os
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
     parser = argparse.ArgumentParser(
         description="ProFinder — bacterial and archaeal promoter identification pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
