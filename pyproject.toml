@@ -22,14 +22,14 @@ classifiers = [
 dependencies = [
     "pandas>=1.3",
     "biopython>=1.79",
-    "tensorflow>=2.6",
+    "tensorflow-cpu>=2.6",
 ]
 
 [project.scripts]
 profinder = "profinder.pipeline:main"
 
 [project.urls]
-Repository = "https://github.com/jmarsh/profinder"
+Repository = "https://github.com/marshomics/profinder"
 
 [tool.setuptools.packages.find]
 include = ["profinder*"]
