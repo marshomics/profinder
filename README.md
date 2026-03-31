@@ -6,6 +6,18 @@ ProFinder extracts high-confidence constitutive promoter candidates from bacteri
   <img src="pipeline.png" width="100%">
 </p>
 
+## Bacteria vs. archaea
+
+The `--domain` flag controls which promoter classifier is used.
+
+`--domain bacteria` (the default) runs [PromoterLCNN](https://github.com/occasumlux/Promoters), a two-stage CNN trained on experimentally verified *E. coli* K-12 promoters from RegulonDB. Stage 1 separates promoters from non-promoters. Stage 2 assigns a sigma-factor subtype (σ70, σ24, σ28, σ32, σ38, σ54). Only the 3'-terminal 81 nt of each intergenic region (closest to the transcription start site) is classified. The HTML report filters to σ70 promoters.
+
+`--domain archaea` runs [iProm-Archaea](https://github.com/PromoterTools/iPromArchaea), a CNN that uses 6-mer frequency encoding to perform binary promoter/non-promoter classification. Archaea lack bacterial sigma factors, so there is no subtype assignment. Each intergenic region is scanned in non-overlapping 100 bp windows from 5' to 3', matching the original tool's design. An IGR is called a promoter if any window scores positive. This means longer intergenic regions are fully scanned rather than truncated to a fixed-length suffix.
+
+When `--domain archaea` is specified, Prokka's `--kingdom` is automatically set to `Archaea` (override with `--kingdom` if needed).
+
+All other pipeline steps (Prokka annotation, IGR extraction, operon identification, HMM marker screening, FIMO motif scanning, report generation) run identically for both domains.
+
 ## How the pipeline works
 
 ProFinder is not a genome-wide promoter annotation tool. It applies a series of biologically motivated filters to produce a short, high-confidence list of promoter sequences upstream of single-copy phylogenetic marker genes: ribosomal proteins, tRNA synthetases, DNA replication components, and similar housekeeping functions. These genes are constitutively expressed because the cell cannot afford to silence them, so their promoters are strong candidates for driving reliable expression.
@@ -20,7 +32,7 @@ For organisms with intergenic GC content above approximately 60% (*Pseudomonas a
 
 ## Requirements
 
-ProFinder needs Python ≥ 3.9, TensorFlow ≥ 2.6, and three bioinformatics tools: Prokka, HMMER, and the MEME Suite (specifically `fimo`). HMM profiles, motif databases, and CNN weights for both classifiers are bundled with the package — nothing else needs to be downloaded.
+ProFinder needs Python ≥ 3.9, TensorFlow CPU ≥ 2.6, and three bioinformatics tools: Prokka, HMMER, and the MEME Suite (specifically `fimo`). HMM profiles, motif databases, and CNN weights for both classifiers are bundled with the package — nothing else needs to be downloaded. The pipeline uses `tensorflow-cpu` (not the full `tensorflow` metapackage) to avoid CUDA dependency issues on headless servers; the CNN inference workload is small enough that GPU acceleration provides no practical benefit.
 
 ## Installation
 
@@ -44,7 +56,7 @@ cd profinder
 pip install .
 ```
 
-This pulls in the Python dependencies (pandas, biopython, tensorflow) via pip and registers the `profinder` command. All bundled data (HMM databases, motif files, CNN weights) is installed as package data alongside the Python modules.
+This pulls in the Python dependencies (pandas, biopython, tensorflow-cpu) via pip and registers the `profinder` command. All bundled data (HMM databases, motif files, CNN weights) is installed as package data alongside the Python modules.
 
 For development (editable install):
 
@@ -61,7 +73,9 @@ hmmsearch -h | head -1    # should print HMMER version
 fimo --version            # should print MEME Suite version
 ```
 
-**Troubleshooting: TensorFlow version conflicts**
+**Troubleshooting: TensorFlow installation issues**
+
+If you see `ModuleNotFoundError: No module named 'tensorflow.python'`, the pip `tensorflow` metapackage was installed without its platform-specific backend. This shouldn't happen with `tensorflow-cpu` (which ProFinder depends on), but if it does, run `pip install --force-reinstall tensorflow-cpu` to fix it.
 
 If conda's solver pulls an older Python (< 3.9) to satisfy Prokka's dependencies, TensorFlow may fail to install or run correctly. Pin Python explicitly as shown above (`python=3.12`). If you see Keras 3 / SavedModel loading errors, make sure your TensorFlow version is ≥ 2.16 — the pipeline includes compatibility shims for the Keras 2 → Keras 3 transition, but versions between 2.12 and 2.15 are the least tested.
 
@@ -278,3 +292,4 @@ profinder/
 ## License
 
 MIT (pipeline code). The iProm-Archaea model weights are from [PromoterTools/iPromArchaea](https://github.com/PromoterTools/iPromArchaea) under MIT (code) / CC-BY-NC-ND (original training data).
+
