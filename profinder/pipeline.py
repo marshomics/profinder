@@ -1778,6 +1778,19 @@ def main():
     )
     cfg.ensure_dirs()
 
+    if cfg.cds_bp > 0 and cfg.cds_bp % 3 != 0:
+        print()
+        print("!" * 60)
+        print("  WARNING: --cds-bp %d is not divisible by 3." % cfg.cds_bp)
+        print()
+        print("  The CDS extension will be %d nt, which is not a whole" % cfg.cds_bp)
+        print("  number of codons. If you concatenate these promoter+CDS")
+        print("  sequences upstream of a coding sequence, the downstream")
+        print("  reading frame will be shifted. Use a multiple of 3")
+        print("  (e.g. 90, 150, 300) to keep the CDS fragment in-frame.")
+        print("!" * 60)
+        print()
+
     if not args.force:
         print("Checkpoint mode: steps with existing output will be skipped.")
         print("Use --force to re-run all steps.\n")
