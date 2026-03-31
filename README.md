@@ -35,8 +35,7 @@ The instructions below create a self-contained conda environment with every depe
 **1. Create the environment and install bioinformatics tools**
 
 ```bash
-conda create -n profinder -c bioconda -c conda-forge \
-    python=3.12 prokka hmmer meme pip -y
+conda create -n profinder -c bioconda -c conda-forge python=3.12 prokka hmmer meme pip -y
 conda activate profinder
 ```
 
