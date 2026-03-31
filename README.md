@@ -6,6 +6,12 @@ ProFinder extracts high-confidence constitutive promoter candidates from bacteri
   <img src="pipeline.png" width="100%">
 </p>
 
+## How the pipeline works
+
+ProFinder is not a genome-wide promoter annotation tool. It applies a series of biologically motivated filters to produce a short, high-confidence list of promoter sequences upstream of single-copy phylogenetic marker genes: ribosomal proteins, tRNA synthetases, DNA replication components, and similar housekeeping functions. These genes are constitutively expressed because the cell cannot afford to silence them, so their promoters are strong candidates for driving reliable expression.
+
+The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions between annotated CDS features, identifies operons using a two-pass proximity/flanking-distance algorithm, and screens for marker genes via hmmsearch against TIGRfam and Pfam (profiles are bundled). Candidate promoters are then classified by the domain-appropriate CNN. Promoters are scanned for transcription factor binding motifs with FIMO, and a visual HTML report is generated.
+
 ## Bacteria vs. archaea
 
 The `--domain` flag controls which promoter classifier is used.
@@ -17,18 +23,6 @@ The `--domain` flag controls which promoter classifier is used.
 When `--domain archaea` is specified, Prokka's `--kingdom` is automatically set to `Archaea` (override with `--kingdom` if needed).
 
 All other pipeline steps (Prokka annotation, IGR extraction, operon identification, HMM marker screening, FIMO motif scanning, report generation) run identically for both domains.
-
-## How the pipeline works
-
-ProFinder is not a genome-wide promoter annotation tool. It applies a series of biologically motivated filters to produce a short, high-confidence list of promoter sequences upstream of single-copy phylogenetic marker genes: ribosomal proteins, tRNA synthetases, DNA replication components, and similar housekeeping functions. These genes are constitutively expressed because the cell cannot afford to silence them, so their promoters are strong candidates for driving reliable expression.
-
-The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions between annotated CDS features, identifies operons using a two-pass proximity/flanking-distance algorithm, and screens for marker genes via hmmsearch against TIGRfam and Pfam (profiles are bundled). Candidate promoters are then classified by the domain-appropriate CNN. Promoters are scanned for transcription factor binding motifs with FIMO, and a visual HTML report is generated.
-
-## Why an *E. coli*-trained classifier works across bacterial species
-
-PromoterLCNN was trained on *E. coli* K-12 σ70 promoters, but the core recognition logic (the −10 TATAAT and −35 TTGACA hexamers, the 17 ± 1 bp spacer, the AT-rich upstream element) is conserved across bacteria. In benchmarking across eleven species spanning seven phyla, ProFinder returned useful promoter shortlists (13 to 33 σ70 marker promoters) for every species with intergenic GC content below 50%, including organisms as distant from *E. coli* as *Bacillus subtilis* (Firmicutes), *Synechocystis* sp. PCC 6803 (Cyanobacteria), and *Vibrio cholerae* (Vibrionaceae).
-
-For organisms with intergenic GC content above approximately 60% (*Pseudomonas aeruginosa*, *Caulobacter crescentus*, *Mycobacterium tuberculosis*), the pipeline returns very few or no σ70 marker promoters. The AT-rich motifs that define σ70 promoters are genuinely sparse in high-GC intergenic regions. The classifier rejects these sequences rather than misclassifying them, so output remains reliable but incomplete.
 
 ## Requirements
 
@@ -288,6 +282,13 @@ profinder/
     └── iPromArchaea/         # Archaeal CNN (Keras weights)
         └── model_cnn.weights.h5
 ```
+
+## Why an *E. coli*-trained classifier works across bacterial species
+
+PromoterLCNN was trained on *E. coli* K-12 σ70 promoters, but the core recognition logic (the −10 TATAAT and −35 TTGACA hexamers, the 17 ± 1 bp spacer, the AT-rich upstream element) is conserved across bacteria. In benchmarking across eleven species spanning seven phyla, ProFinder returned useful promoter shortlists (13 to 33 σ70 marker promoters) for every species with intergenic GC content below 50%, including organisms as distant from *E. coli* as *Bacillus subtilis* (Firmicutes), *Synechocystis* sp. PCC 6803 (Cyanobacteria), and *Vibrio cholerae* (Vibrionaceae).
+
+For organisms with intergenic GC content above approximately 60% (*Pseudomonas aeruginosa*, *Caulobacter crescentus*, *Mycobacterium tuberculosis*), the pipeline returns very few or no σ70 marker promoters. The AT-rich motifs that define σ70 promoters are genuinely sparse in high-GC intergenic regions. The classifier rejects these sequences rather than misclassifying them, so output remains reliable but incomplete.
+
 
 ## License
 
