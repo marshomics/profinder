@@ -15,10 +15,15 @@ Orientation labels mirror PIGGY's convention:
     DP     ← IGR →        divergent promoter  (genes point away from IGR)
     CONV   → IGR ←        convergent / terminator (genes point into IGR)
 """
-
+import gzip
 import pandas as pd
 from Bio import SeqIO
 
+def _open_maybe_gzip(path):
+    path = str(path)
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt")
+    return open(path, "r")
 
 def _classify_orientation(left_strand: str, right_strand: str) -> str:
     """Return PIGGY-compatible orientation label for a gene pair."""
@@ -59,7 +64,10 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
                  left_gene, right_gene, sequence
     """
     # Load contig sequences
-    contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
+    # contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
+    with _open_maybe_gzip(fasta_path) as fh:
+        contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(fh, "fasta")}
+
 
     # Parse CDS entries from the GFF
     genes = []
