@@ -5,7 +5,6 @@ ProFinder extracts high-confidence constitutive promoter candidates from bacteri
 **Access the server:**
 [ProFinder Web Interface](https://plabase.cs.uni-tuebingen.de/profinder/)
 
-
 <p align="center">
   <img src="pipeline.png" width="100%">
 </p>
