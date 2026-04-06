@@ -50,6 +50,7 @@ Steps
 """
 
 import argparse
+import gzip
 import html as html_mod
 import re
 import subprocess
@@ -60,7 +61,7 @@ import pandas as pd
 from Bio.Seq import Seq
 
 from .config import Config
-from .igr_extractor import extract_igrs
+from .igr_extractor import extract_igrs,_open_maybe_gzip
 
 
 # =====================================================================
@@ -192,6 +193,14 @@ def step01_run_prokka(cfg: Config, force: bool = False):
             f'eval "$(conda shell.bash hook 2>/dev/null)"; '
             f"conda activate {cfg.conda_env_prokka}; "
         )
+
+    input_for_prokka = cfg.input_fasta
+
+    if str(cfg.input_fasta).endswith(".gz"):
+        input_for_prokka = cfg.output_dir / f"{cfg.input_fasta.stem}.decompressed.fna"
+        with gzip.open(cfg.input_fasta, "rt") as fin, open(input_for_prokka, "w") as fout:
+            fout.write(fin.read())
+
     parts.append(
         f"{cfg.prokka_bin}"
         f" --outdir {cfg.prokka_dir}"
@@ -199,7 +208,7 @@ def step01_run_prokka(cfg: Config, force: bool = False):
         f" --kingdom {cfg.prokka_kingdom}"
         f" --cpus {cfg.threads}"
         f" --force"
-        f" {cfg.input_fasta}"
+        f" {input_for_prokka}"
     )
     cmd = "set -euo pipefail; " + "".join(parts)
     result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
@@ -531,8 +540,12 @@ def _write_fasta(df, output_path, short_header=False):
 
 def _load_contigs(fasta_path):
     """Load contig sequences from a genome FASTA into a dict."""
+    # from Bio import SeqIO
+    # return {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
     from Bio import SeqIO
-    return {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
+    with _open_maybe_gzip(fasta_path) as fh:
+        return {rec.id: str(rec.seq) for rec in SeqIO.parse(fh, "fasta")}
+
 
 
 def _extract_cds_start(row, contigs, n_bp):
