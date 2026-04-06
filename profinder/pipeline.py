@@ -466,7 +466,7 @@ def step06_filter_operons_add_markers(cfg: Config, force: bool = False):
 
 def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
     """Match IGRs to marker operon genes."""
-    if not force and cfg.promoter_markers.exists():
+    if not force and cfg.promoter_markers.exists() and cfg.promoter_markers_hmm.exists():
         print("── Promoter markers file already exists, skipping ──")
         print("  Step 7 complete.\n")
         return
@@ -478,6 +478,7 @@ def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
     except (FileNotFoundError, pd.errors.EmptyDataError):
         print("  No marker data available.")
         pd.DataFrame().to_csv(cfg.promoter_markers, sep="\t", index=False)
+        pd.DataFrame().to_csv(cfg.promoter_markers_hmm, sep="\t", index=False)
         print("  Step 7 complete.\n")
         return
 
@@ -504,6 +505,44 @@ def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
     matched = igr[igr["marker_match"] != "none"].copy()
     matched.to_csv(cfg.promoter_markers, sep="\t", index=False)
     print(f"  Matched promoter markers ({len(matched)} rows) -> {cfg.promoter_markers}")
+
+    # Build expanded variant with one row per IGR × HMM profile match.
+    # Determine which gene column is the marker gene for each matched IGR.
+    matched["marker_gene"] = matched.apply(
+        lambda r: r["right_gene"] if r["marker_match"] == "CO_F" else r["left_gene"],
+        axis=1,
+    )
+
+    # Load HMM filtered hits for the profile names
+    hmm_profiles = pd.DataFrame()
+    if cfg.hmm_filtered.exists():
+        try:
+            hmm_profiles = pd.read_csv(
+                cfg.hmm_filtered, sep="\t",
+                usecols=["target_name", "query_name"],
+            )
+        except (pd.errors.EmptyDataError, ValueError):
+            pass
+
+    if hmm_profiles.empty:
+        matched["hmm_profile"] = "no_hmm"
+        expanded = matched
+    else:
+        # Merge: one row per IGR × profile. A gene with 3 profile hits
+        # produces 3 rows for its IGR.
+        expanded = pd.merge(
+            matched, hmm_profiles,
+            how="left",
+            left_on="marker_gene", right_on="target_name",
+        )
+        expanded.rename(columns={"query_name": "hmm_profile"}, inplace=True)
+        expanded.drop(columns=["target_name"], inplace=True, errors="ignore")
+        expanded["hmm_profile"] = expanded["hmm_profile"].fillna("no_hmm")
+
+    expanded.drop(columns=["marker_gene"], inplace=True, errors="ignore")
+    expanded.to_csv(cfg.promoter_markers_hmm, sep="\t", index=False)
+    print(f"  Expanded markers with HMM profiles ({len(expanded)} rows) "
+          f"-> {cfg.promoter_markers_hmm}")
     print("  Step 7 complete.\n")
 
 
