@@ -27,19 +27,14 @@ class Config:
     conda_env_hmm: str = ""
     conda_env_meme: str = ""
 
-    # ── HMM databases (bundled by default) ──────────────────────────
-    tigrfam_hmm: Path = None
-    pfam_hmm: Path = None
+    # ── HMM profiles directory (bundled by default) ────────────────
+    hmm_profiles_dir: Path = None
 
     def __post_init__(self):
         """Resolve bundled HMM and weight paths if none were provided."""
-        bundled_hmms = Path(__file__).parent / "hmms"
-        if self.tigrfam_hmm is None:
-            candidate = bundled_hmms / "tigrfam.hmm"
-            self.tigrfam_hmm = candidate if candidate.exists() else None
-        if self.pfam_hmm is None:
-            candidate = bundled_hmms / "Pfam-A.hmm"
-            self.pfam_hmm = candidate if candidate.exists() else None
+        if self.hmm_profiles_dir is None:
+            candidate = Path(__file__).parent / "hmms"
+            self.hmm_profiles_dir = candidate if candidate.is_dir() else None
         if self.lcnn_weights_dir is None:
             candidate = Path(__file__).parent / "weights" / "PromoterLCNN"
             self.lcnn_weights_dir = candidate if candidate.is_dir() else None
