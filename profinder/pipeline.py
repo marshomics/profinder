@@ -50,7 +50,6 @@ Steps
 """
 
 import argparse
-import gzip
 import html as html_mod
 import re
 import subprocess
@@ -61,7 +60,7 @@ import pandas as pd
 from Bio.Seq import Seq
 
 from .config import Config
-from .igr_extractor import extract_igrs,_open_maybe_gzip
+from .igr_extractor import extract_igrs
 
 
 # =====================================================================
@@ -193,14 +192,6 @@ def step01_run_prokka(cfg: Config, force: bool = False):
             f'eval "$(conda shell.bash hook 2>/dev/null)"; '
             f"conda activate {cfg.conda_env_prokka}; "
         )
-    
-    input_for_prokka = cfg.input_fasta
-
-    if str(cfg.input_fasta).endswith(".gz"):
-        input_for_prokka = cfg.output_dir / f"{cfg.input_fasta.stem}.decompressed.fna"
-        with gzip.open(cfg.input_fasta, "rt") as fin, open(input_for_prokka, "w") as fout:
-            fout.write(fin.read())
-
     parts.append(
         f"{cfg.prokka_bin}"
         f" --outdir {cfg.prokka_dir}"
@@ -208,7 +199,7 @@ def step01_run_prokka(cfg: Config, force: bool = False):
         f" --kingdom {cfg.prokka_kingdom}"
         f" --cpus {cfg.threads}"
         f" --force"
-        f" {input_for_prokka}"
+        f" {cfg.input_fasta}"
     )
     cmd = "set -euo pipefail; " + "".join(parts)
     result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
@@ -391,6 +382,17 @@ def step05_filter_hmm(cfg: Config, force: bool = False):
     df["full_sequence_bitscore"] = pd.to_numeric(df["full_sequence_bitscore"], errors="coerce")
     df = df[df["full_sequence_bitscore"] >= cfg.hmm_bitscore_min]
 
+    # Filter to domain-specific HMM profiles
+    if cfg.hmm_profile_list is not None and cfg.hmm_profile_list.is_file():
+        allowed = set(cfg.hmm_profile_list.read_text().strip().splitlines())
+        before = len(df)
+        df = df[df["accession2"].isin(allowed)]
+        print(f"  Domain filter ({cfg.domain}): {before} -> {len(df)} hits "
+              f"({len(allowed)} allowed profiles from {cfg.hmm_profile_list.name})")
+    else:
+        print(f"  WARNING: no domain-specific profile list found for '{cfg.domain}'; "
+              f"using all HMM hits")
+
     # Keep best hit per target+accession
     if not df.empty:
         best_idx = df.groupby(["target_name", "accession2"])["full_sequence_bitscore"].idxmax()
@@ -529,11 +531,8 @@ def _write_fasta(df, output_path, short_header=False):
 
 def _load_contigs(fasta_path):
     """Load contig sequences from a genome FASTA into a dict."""
-    # from Bio import SeqIO
-    # return {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
     from Bio import SeqIO
-    with _open_maybe_gzip(fasta_path) as fh:
-        return {rec.id: str(rec.seq) for rec in SeqIO.parse(fh, "fasta")}
+    return {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
 
 
 def _extract_cds_start(row, contigs, n_bp):
@@ -1750,6 +1749,9 @@ def main():
                         help="Min flanking distance for operon boundaries (default: 75)")
     parser.add_argument("--hmm-bitscore", type=float, default=25.0,
                         help="Minimum HMM bitscore (default: 25.0)")
+    parser.add_argument("--hmm-profile-list", type=Path, default=None,
+                        help="File listing allowed HMM profile accessions, one "
+                             "per line (default: bundled domain-specific list)")
     parser.add_argument("--cds-bp", type=int, default=0,
                         help="Number of CDS-start nucleotides to append to "
                              "promoter sequences in additional FASTA outputs "
@@ -1793,6 +1795,7 @@ def main():
         max_internal_distance=args.max_internal_dist,
         min_flanking_distance=args.min_flanking_dist,
         hmm_bitscore_min=args.hmm_bitscore,
+        hmm_profile_list=args.hmm_profile_list,
         motifs_dir=args.motifs_dir,
         fimo_threshold=args.fimo_threshold,
         cds_bp=args.cds_bp,
