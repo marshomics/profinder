@@ -137,6 +137,10 @@ class Config:
         return self.output_dir / "promoter_markers.tsv"
 
     @property
+    def promoter_markers_hmm(self) -> Path:
+        return self.output_dir / "promoter_markers_hmm.tsv"
+
+    @property
     def promoter_fasta(self) -> Path:
         return self.output_dir / "promoters.fasta"
 
