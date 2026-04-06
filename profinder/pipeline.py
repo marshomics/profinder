@@ -293,38 +293,44 @@ def step03_identify_operons(cfg: Config, force: bool = False):
 
 
 def step04_run_hmmsearch(cfg: Config, force: bool = False):
-    """Run hmmsearch (TIGRfam + Pfam) on the Prokka .faa."""
-    tigr_ok = cfg.tigrfam_hmm is not None and cfg.tigrfam_hmm.is_file()
-    pfam_ok = cfg.pfam_hmm is not None and cfg.pfam_hmm.is_file()
-    if not tigr_ok or not pfam_ok:
-        print("── HMM database files not available ──")
-        if not tigr_ok:
-            print(f"  tigrfam: {cfg.tigrfam_hmm} (found={tigr_ok})")
-        if not pfam_ok:
-            print(f"  pfam:    {cfg.pfam_hmm} (found={pfam_ok})")
-        print("  Provide --tigrfam and --pfam, or reinstall to restore bundled HMMs.")
+    """Run hmmsearch for every individual .hmm profile in the profiles directory."""
+    if cfg.hmm_profiles_dir is None or not cfg.hmm_profiles_dir.is_dir():
+        print("── HMM profiles directory not available ──")
+        print(f"  hmm_profiles_dir: {cfg.hmm_profiles_dir}")
+        print("  Provide --hmm-dir or reinstall to restore bundled profiles.")
         print("  Step 4 complete.\n")
         return
 
-    print(f"  Using TIGRfam: {cfg.tigrfam_hmm}")
-    print(f"  Using Pfam:    {cfg.pfam_hmm}")
-
-    tigr_out = cfg.hmm_dir / "hmm_tigrfam.tblout"
-    pfam_out = cfg.hmm_dir / "hmm_pfam.tblout"
-
-    if not force and tigr_out.exists() and pfam_out.exists():
-        print("── HMM output already exists, skipping ──")
+    hmm_files = sorted(cfg.hmm_profiles_dir.glob("*.hmm"))
+    if not hmm_files:
+        print(f"── No .hmm files found in {cfg.hmm_profiles_dir} ──")
         print("  Step 4 complete.\n")
         return
 
-    print("── Running hmmsearch ──")
+    print(f"  Using {len(hmm_files)} HMM profiles from: {cfg.hmm_profiles_dir}")
+
+    tblout_dir = cfg.hmm_dir / "tblout"
+    tblout_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if all tblout files already exist
+    if not force and all(
+        (tblout_dir / (f.stem + ".tblout")).exists() for f in hmm_files
+    ):
+        print("── HMM output already exists for all profiles, skipping ──")
+        print("  Step 4 complete.\n")
+        return
+
+    print(f"── Running hmmsearch ({len(hmm_files)} profiles) ──")
     cfg.hmm_dir.mkdir(parents=True, exist_ok=True)
 
-    for db_label, db_path, out_file in [
-        ("TIGRfam", cfg.tigrfam_hmm, tigr_out),
-        ("Pfam", cfg.pfam_hmm, pfam_out),
-    ]:
-        log_file = out_file.with_suffix(".log")
+    failed = 0
+    for i, hmm_path in enumerate(hmm_files, 1):
+        out_file = tblout_dir / (hmm_path.stem + ".tblout")
+        log_file = tblout_dir / (hmm_path.stem + ".log")
+
+        if not force and out_file.exists():
+            continue
+
         parts = []
         if cfg.conda_env_hmm:
             parts.append(
@@ -336,38 +342,43 @@ def step04_run_hmmsearch(cfg: Config, force: bool = False):
             f" --tblout {out_file}"
             f" -o {log_file}"
             f" --noali --cpu {cfg.threads}"
-            f" {db_path} {cfg.faa_file}"
+            f" {hmm_path} {cfg.faa_file}"
         )
         cmd = "set -euo pipefail; " + "".join(parts)
-        print(f"  {db_label}...")
         result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"  WARNING: hmmsearch {db_label} failed: {result.stderr[-300:]}")
-            return
+            print(f"  WARNING: hmmsearch failed for {hmm_path.name}: "
+                  f"{result.stderr[-200:]}")
+            failed += 1
+
+        if i % 100 == 0 or i == len(hmm_files):
+            print(f"  {i}/{len(hmm_files)} profiles searched...")
+
+    if failed:
+        print(f"  {failed} profile(s) failed during hmmsearch.")
 
     print("  Step 4 complete.\n")
 
 
 def step05_filter_hmm(cfg: Config, force: bool = False):
-    """Consolidate and filter HMM hits."""
+    """Consolidate and filter HMM hits from individual profile searches."""
     if not force and cfg.hmm_filtered.exists():
         print("── Filtered HMM file already exists, skipping ──")
         print("  Step 5 complete.\n")
         return
 
-    tigr_out = cfg.hmm_dir / "hmm_tigrfam.tblout"
-    pfam_out = cfg.hmm_dir / "hmm_pfam.tblout"
+    tblout_dir = cfg.hmm_dir / "tblout"
+    tblout_files = sorted(tblout_dir.glob("*.tblout")) if tblout_dir.is_dir() else []
 
-    if not tigr_out.exists() and not pfam_out.exists():
+    if not tblout_files:
         print("── No HMM output to filter, skipping ──")
         print("  Step 5 complete.\n")
         return
 
-    print("── Filtering HMM output ──")
+    print(f"── Filtering HMM output ({len(tblout_files)} tblout files) ──")
     all_rows = []
-    for f in [tigr_out, pfam_out]:
-        if f.exists():
-            all_rows.extend(_parse_hmm_tblout(str(f)))
+    for f in tblout_files:
+        all_rows.extend(_parse_hmm_tblout(str(f)))
 
     if not all_rows:
         print("  No HMM hits found.")
@@ -378,17 +389,15 @@ def step05_filter_hmm(cfg: Config, force: bool = False):
 
     df = pd.DataFrame(all_rows, columns=_HMM_HEADER)
     df.to_csv(cfg.hmm_combined, sep="\t", index=False)
+    print(f"  Combined HMM hits: {len(df)}")
 
     df["full_sequence_bitscore"] = pd.to_numeric(df["full_sequence_bitscore"], errors="coerce")
     df = df[df["full_sequence_bitscore"] >= cfg.hmm_bitscore_min]
 
-    # Keep best hit per target+accession
-    if not df.empty:
-        best_idx = df.groupby(["target_name", "accession2"])["full_sequence_bitscore"].idxmax()
-        df = df.loc[best_idx]
-
+    # Keep ALL matches — a gene may match multiple profiles and all are retained.
     df.to_csv(cfg.hmm_filtered, sep="\t", index=False)
-    print(f"  Filtered HMM ({len(df)} rows) -> {cfg.hmm_filtered}")
+    n_genes = df["target_name"].nunique() if not df.empty else 0
+    print(f"  Filtered HMM ({len(df)} hits across {n_genes} genes) -> {cfg.hmm_filtered}")
     print("  Step 5 complete.\n")
 
 
@@ -1689,10 +1698,9 @@ def main():
                         help="Path to prokka binary (default: prokka)")
     parser.add_argument("--hmmsearch", default="hmmsearch",
                         help="Path to hmmsearch binary (default: hmmsearch)")
-    parser.add_argument("--tigrfam", type=Path, default=None,
-                        help="Path to TIGRfam HMM database (default: bundled)")
-    parser.add_argument("--pfam", type=Path, default=None,
-                        help="Path to Pfam-A HMM database (default: bundled)")
+    parser.add_argument("--hmm-dir", type=Path, default=None,
+                        help="Directory containing individual .hmm profile files "
+                             "(default: bundled profiles)")
 
     # PromoterLCNN (bacteria)
     parser.add_argument("--lcnn-weights", type=Path, default=None,
@@ -1766,8 +1774,7 @@ def main():
         prokka_bin=args.prokka,
         hmmsearch_bin=args.hmmsearch,
         fimo_bin=args.fimo,
-        tigrfam_hmm=args.tigrfam,
-        pfam_hmm=args.pfam,
+        hmm_profiles_dir=args.hmm_dir,
         lcnn_weights_dir=args.lcnn_weights,
         ipromarchaea_weights=args.ipromarchaea_weights,
         conda_env_prokka=args.conda_prokka,
