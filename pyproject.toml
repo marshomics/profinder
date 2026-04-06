@@ -29,10 +29,10 @@ dependencies = [
 profinder = "profinder.pipeline:main"
 
 [project.urls]
-Repository = "https://github.com/marshomics/profinder"
+Repository = "https://github.com/jmarsh/profinder"
 
 [tool.setuptools.packages.find]
 include = ["profinder*"]
 
 [tool.setuptools.package-data]
-profinder = ["motifs/*.meme", "hmms/*.hmm", "weights/**/*"]
+profinder = ["motifs/*.meme", "hmms/*.hmm", "hmms/*.txt", "weights/**/*"]
