@@ -51,11 +51,6 @@ class Config:
         # Normalise domain to lowercase
         self.domain = self.domain.lower()
 
-        # Resolve domain-specific HMM profile allowlist
-        if self.hmm_profile_list is None:
-            fname = f"hmm_{self.domain}.txt"
-            candidate = bundled_hmms / fname
-            self.hmm_profile_list = candidate if candidate.exists() else None
 
     # ── Parallelism ──────────────────────────────────────────────────
     threads: int = 4
@@ -75,7 +70,6 @@ class Config:
 
     # ── HMM filtering ────────────────────────────────────────────────
     hmm_bitscore_min: float = 25.0
-    hmm_profile_list: Path = None  # domain-specific profile allowlist (resolved in __post_init__)
 
     # ── PromoterLCNN parameters (bacteria) ──────────────────────────────
     lcnn_weights_dir: Path = None     # parent dir containing IsPromoter_fold_5/ and PromotersOnly_fold_1/
