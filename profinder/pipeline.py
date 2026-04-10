@@ -235,8 +235,20 @@ def step02_extract_igrs(cfg: Config, force: bool = False):
 
     # Use the Prokka .fna (nucleotide FASTA with contig IDs matching the GFF)
     fasta_source = cfg.fna_file if cfg.fna_file.exists() else cfg.input_fasta
+    print(f"  GFF:   {cfg.gff_file}")
+    print(f"  FASTA: {fasta_source}")
     igr_df = extract_igrs(cfg.gff_file, fasta_source,
                           size_min=cfg.igr_size_min, size_max=cfg.igr_size_max)
+
+    # Warn if most sequences are empty (contig ID mismatch)
+    if not igr_df.empty:
+        n_empty = igr_df["sequence"].isna().sum() + (igr_df["sequence"] == "").sum()
+        if n_empty > 0:
+            print(f"  WARNING: {n_empty}/{len(igr_df)} IGRs have empty sequences.")
+            print("    This usually means contig IDs in the GFF don't match "
+                  "the FASTA headers.")
+            print("    If you supplied an FNA file in the batch table, make "
+                  "sure it contains contig sequences (not per-CDS nucleotides).")
 
     igr_df.to_csv(cfg.igr_summary, sep="\t", index=False)
     print(f"  IGR summary ({len(igr_df)} regions) -> {cfg.igr_summary}")
@@ -575,7 +587,9 @@ def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
     print("  Step 7 complete.\n")
 
 
-def _reverse_complement(seq: str) -> str:
+def _reverse_complement(seq) -> str:
+    if not isinstance(seq, str) or not seq:
+        return ""
     return str(Seq(seq).reverse_complement())
 
 
