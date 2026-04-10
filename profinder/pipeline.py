@@ -234,7 +234,29 @@ def step02_extract_igrs(cfg: Config, force: bool = False):
     cfg.igr_dir.mkdir(parents=True, exist_ok=True)
 
     # Use the Prokka .fna (nucleotide FASTA with contig IDs matching the GFF)
-    fasta_source = cfg.fna_file if cfg.fna_file.exists() else cfg.input_fasta
+    # but only if it actually contains contig-level sequences. Per-CDS
+    # nucleotide files (.ffn/.fnn) use gene locus tags as headers rather
+    # than contig accessions, so they won't match the GFF seqid column.
+    fasta_source = cfg.input_fasta
+    if cfg.fna_file.exists():
+        # Read the contig IDs from the GFF (first column of data lines)
+        gff_contigs = set()
+        with open(str(cfg.gff_file)) as fh:
+            for line in fh:
+                if line.startswith("##FASTA"):
+                    break
+                if line.startswith("#"):
+                    continue
+                gff_contigs.add(line.split("\t", 1)[0])
+        # Check if any GFF contig appears in the FNA headers
+        from Bio import SeqIO
+        fna_ids = {rec.id for rec in SeqIO.parse(str(cfg.fna_file), "fasta")}
+        if gff_contigs & fna_ids:
+            fasta_source = cfg.fna_file
+        else:
+            print(f"  NOTE: FNA file ({cfg.fna_file.name}) does not contain "
+                  f"contig sequences matching the GFF — using genome FASTA instead.")
+
     print(f"  GFF:   {cfg.gff_file}")
     print(f"  FASTA: {fasta_source}")
     igr_df = extract_igrs(cfg.gff_file, fasta_source,
@@ -802,7 +824,7 @@ def _step10_bacteria(cfg: Config, all_igr, force: bool = False):
     seqs_81 = []
     short_mask = []
     for seq in all_igr["sequence_5p_to_3p"]:
-        if len(seq) >= _LCNN_LEN:
+        if isinstance(seq, str) and len(seq) >= _LCNN_LEN:
             seqs_81.append(seq[-_LCNN_LEN:])
             short_mask.append(False)
         else:
@@ -874,7 +896,8 @@ def _step10_archaea(cfg: Config, all_igr, force: bool = False):
     # Sequences < 80 nt will yield no windows inside predict(), but we
     # count them here for the log message.
     _ARCHAEA_MIN = 80
-    n_short = sum(1 for seq in all_igr["sequence_5p_to_3p"] if len(seq) < _ARCHAEA_MIN)
+    n_short = sum(1 for seq in all_igr["sequence_5p_to_3p"]
+                  if not isinstance(seq, str) or len(seq) < _ARCHAEA_MIN)
     if n_short:
         print(f"  {n_short} sequence(s) shorter than {_ARCHAEA_MIN} nt — "
               f"classified as NON_PROMOTER (no valid windows)")
