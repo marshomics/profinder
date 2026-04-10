@@ -528,16 +528,17 @@ def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
         matched["hmm_profile"] = "no_hmm"
         expanded = matched
     else:
-        # Merge: one row per IGR × profile. A gene with 3 profile hits
-        # produces 3 rows for its IGR.
+        # Inner merge: only keep IGRs whose marker gene has a direct HMM
+        # hit.  Step 6 keeps entire operons when any gene in the operon
+        # matches, so some IGRs flank operon-member genes that have no HMM
+        # hit themselves.  Those are excluded here.
         expanded = pd.merge(
             matched, hmm_profiles,
-            how="left",
+            how="inner",
             left_on="marker_gene", right_on="target_name",
         )
         expanded.rename(columns={"query_name": "hmm_profile"}, inplace=True)
         expanded.drop(columns=["target_name"], inplace=True, errors="ignore")
-        expanded["hmm_profile"] = expanded["hmm_profile"].fillna("no_hmm")
 
     expanded.drop(columns=["marker_gene"], inplace=True, errors="ignore")
     expanded.to_csv(cfg.promoter_markers_hmm, sep="\t", index=False)
@@ -1713,10 +1714,19 @@ def main():
         description="ProFinder — bacterial and archaeal promoter identification pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("-i", "--input", type=Path, required="--list" not in sys.argv,
-                        help="Input genome FASTA file")
+    input_group = parser.add_mutually_exclusive_group(
+        required="--list" not in sys.argv,
+    )
+    input_group.add_argument("-i", "--input", type=Path,
+                             help="Input genome FASTA file (single-sample mode)")
+    input_group.add_argument("--batch", type=Path,
+                             help="TSV table for batch mode. Required columns: "
+                                  "sample_id, fasta. Optional columns: gff, faa, "
+                                  "fna. When gff and faa are provided, Prokka "
+                                  "(step 1) is skipped for that sample.")
     parser.add_argument("-o", "--output", type=Path, default=Path("output"),
-                        help="Output directory (default: output/)")
+                        help="Output directory (default: output/). In batch mode "
+                             "each sample gets a subdirectory.")
     parser.add_argument("--domain", choices=["bacteria", "archaea"],
                         default="bacteria",
                         help="Target domain: 'bacteria' uses PromoterLCNN "
@@ -1797,18 +1807,36 @@ def main():
             print(f"  {num:2d}. {name}")
         sys.exit(0)
 
-    if not args.input.exists():
-        sys.exit(f"Input file not found: {args.input}")
-
     # When running in archaea mode, default Prokka kingdom to Archaea
     # unless the user explicitly provided --kingdom.
     kingdom = args.kingdom
     if args.domain == "archaea" and kingdom == "Bacteria":
         kingdom = "Archaea"
 
-    cfg = Config(
-        input_fasta=args.input.resolve(),
-        output_dir=args.output.resolve(),
+    # ── Batch mode ──────────────────────────────────────────────────
+    if args.batch is not None:
+        if not args.batch.exists():
+            sys.exit(f"Batch file not found: {args.batch}")
+        _run_batch(args, kingdom)
+        return
+
+    # ── Single-sample mode ──────────────────────────────────────────
+    if not args.input.exists():
+        sys.exit(f"Input file not found: {args.input}")
+
+    cfg = _build_config(args, kingdom,
+                        input_fasta=args.input.resolve(),
+                        output_dir=args.output.resolve())
+    _run_pipeline(cfg, args)
+
+    print("\nPipeline complete.")
+
+
+def _build_config(args, kingdom, *, input_fasta, output_dir, prokka_prefix=None):
+    """Create a Config from CLI args, overriding paths as needed."""
+    return Config(
+        input_fasta=input_fasta,
+        output_dir=output_dir,
         domain=args.domain,
         prokka_bin=args.prokka,
         hmmsearch_bin=args.hmmsearch,
@@ -1821,7 +1849,7 @@ def main():
         conda_env_meme=args.conda_meme,
         threads=args.threads,
         prokka_kingdom=kingdom,
-        prokka_prefix=args.prefix,
+        prokka_prefix=prokka_prefix or args.prefix,
         igr_size_min=args.igr_min,
         igr_size_max=args.igr_max,
         max_internal_distance=args.max_internal_dist,
@@ -1831,6 +1859,10 @@ def main():
         fimo_threshold=args.fimo_threshold,
         cds_bp=args.cds_bp,
     )
+
+
+def _run_pipeline(cfg, args):
+    """Run pipeline steps on a single Config."""
     cfg.ensure_dirs()
 
     if cfg.cds_bp > 0 and cfg.cds_bp % 3 != 0:
@@ -1857,7 +1889,96 @@ def main():
             print(f"{'=' * 60}\n")
             func(cfg, force=args.force)
 
-    print("\nPipeline complete.")
+
+def _link_prokka_files(cfg, row):
+    """Symlink user-supplied Prokka files into the expected output layout.
+
+    Returns the step number to start from: 2 if Prokka files were linked
+    (skip step 1), or 1 if they were not provided.
+    """
+    gff_path = row.get("gff", "")
+    faa_path = row.get("faa", "")
+
+    if not gff_path or not faa_path:
+        return 1  # no Prokka files supplied — run step 1 normally
+
+    gff_src = Path(str(gff_path)).resolve()
+    faa_src = Path(str(faa_path)).resolve()
+
+    for label, src in [("gff", gff_src), ("faa", faa_src)]:
+        if not src.exists():
+            sys.exit(f"Batch table references missing {label} file: {src}")
+
+    cfg.prokka_dir.mkdir(parents=True, exist_ok=True)
+
+    # Derive the prefix from the GFF filename so downstream paths resolve.
+    prefix = gff_src.stem  # e.g. "genome" from "genome.gff"
+    cfg.prokka_prefix = prefix
+
+    # Symlink GFF and FAA
+    for src, suffix in [(gff_src, ".gff"), (faa_src, ".faa")]:
+        dest = cfg.prokka_dir / f"{prefix}{suffix}"
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+        dest.symlink_to(src)
+
+    # Optional: FNA (nucleotide FASTA from Prokka)
+    fna_path = row.get("fna", "")
+    if fna_path:
+        fna_src = Path(str(fna_path)).resolve()
+        if fna_src.exists():
+            dest = cfg.prokka_dir / f"{prefix}.fna"
+            if dest.exists() or dest.is_symlink():
+                dest.unlink()
+            dest.symlink_to(fna_src)
+
+    return 2  # skip step 1
+
+
+def _run_batch(args, kingdom):
+    """Run the pipeline once per row in a batch TSV table."""
+    batch_df = pd.read_csv(args.batch, sep="\t")
+
+    required_cols = {"sample_id", "fasta"}
+    missing = required_cols - set(batch_df.columns)
+    if missing:
+        sys.exit(f"Batch table is missing required columns: {', '.join(sorted(missing))}")
+
+    n_samples = len(batch_df)
+    print(f"Batch mode: {n_samples} sample(s) from {args.batch}\n")
+
+    for idx, row in batch_df.iterrows():
+        sample_id = str(row["sample_id"])
+        fasta_path = Path(str(row["fasta"])).resolve()
+
+        if not fasta_path.exists():
+            sys.exit(f"FASTA not found for sample '{sample_id}': {fasta_path}")
+
+        sample_output = args.output.resolve() / sample_id
+
+        print("\n" + "#" * 60)
+        print(f"  SAMPLE {idx + 1}/{n_samples}: {sample_id}")
+        print("#" * 60 + "\n")
+
+        cfg = _build_config(
+            args, kingdom,
+            input_fasta=fasta_path,
+            output_dir=sample_output,
+        )
+
+        # If Prokka files are pre-supplied, symlink them and skip step 1.
+        min_step = _link_prokka_files(cfg, row)
+        effective_start = max(args.start, min_step)
+
+        # Temporarily override start so _run_pipeline respects it.
+        saved_start = args.start
+        args.start = effective_start
+        _run_pipeline(cfg, args)
+        args.start = saved_start
+
+        print(f"\n  Sample '{sample_id}' complete.\n")
+
+    print(f"\nBatch complete. {n_samples} sample(s) processed.")
 
 
 if __name__ == "__main__":
