@@ -95,9 +95,20 @@ def _parse_gff_for_operons(gff_path: str):
 
 
 def _extract_gene_id(attributes: str) -> str:
-    for attr in attributes.split(";"):
-        if attr.startswith("ID="):
-            return attr[3:]
+    """Extract a gene identifier from GFF attribute string.
+
+    Tries, in order: ID=, locus_tag=, gene=, Name= (stripping any
+    trailing ' gene' or ' CDS' suffix from Geneious-style names).
+    """
+    for key in ("ID=", "locus_tag=", "gene=", "Name="):
+        for attr in attributes.split(";"):
+            if attr.startswith(key):
+                val = attr[len(key):]
+                # Geneious appends " gene" or " CDS" to Name values
+                for suffix in (" gene", " CDS"):
+                    if val.endswith(suffix):
+                        val = val[:-len(suffix)]
+                return val
     return ""
 
 
@@ -454,6 +465,23 @@ def step06_filter_operons_add_markers(cfg: Config, force: bool = False):
         merged.to_csv(cfg.operon_filtered_markers, sep="\t", index=False)
         print(f"  Operons with markers ({len(merged)} rows) "
               f"-> {cfg.operon_filtered_markers}")
+
+        if len(merged) == 0 and not hmm.empty and not filtered.empty:
+            operon_genes = set(filtered["Gene"].dropna())
+            hmm_genes = set(hmm["target_name"].dropna())
+            overlap = operon_genes & hmm_genes
+            print()
+            print("  WARNING: 0 marker operons found despite HMM hits.")
+            print(f"    Operon gene IDs (first 5): "
+                  f"{sorted(operon_genes)[:5]}")
+            print(f"    HMM target names (first 5): "
+                  f"{sorted(hmm_genes)[:5]}")
+            print(f"    Overlap: {len(overlap)} gene(s)")
+            if not overlap:
+                print("    The gene IDs in the GFF and the protein IDs in "
+                      "the FAA appear to use different naming schemes.")
+                print("    Check that both files come from the same "
+                      "annotation run.")
     else:
         # No HMM data: use all filtered operons as-is
         print("  No HMM data available; using all filtered operons as markers")
@@ -663,6 +691,9 @@ def step08_extract_marker_promoters(cfg: Config, force: bool = False):
     # Remove divergent promoters (ambiguous orientation)
     df = df[df["orientation"] != "DP"].copy()
 
+    # Drop rows with missing sequences
+    df = df[df["sequence"].notna() & (df["sequence"] != "")].copy()
+
     # Orient 5'→3': CO_R sequences need reverse complement
     df["sequence_5p_to_3p"] = df.apply(
         lambda r: _reverse_complement(r["sequence"]) if r["orientation"] == "CO_R"
@@ -703,6 +734,13 @@ def step09_extract_all_promoters(cfg: Config, force: bool = False):
     n_dp = len(promoter_orientations) - len(df)
     if n_dp:
         print(f"  Excluded {n_dp} divergent promoters (ambiguous orientation)")
+
+    # Drop rows with missing sequences (can happen with degenerate IGRs)
+    n_before = len(df)
+    df = df[df["sequence"].notna() & (df["sequence"] != "")].copy()
+    n_dropped_na = n_before - len(df)
+    if n_dropped_na:
+        print(f"  Dropped {n_dropped_na} IGRs with missing sequences")
 
     # Orient 5'→3'
     df["sequence_5p_to_3p"] = df.apply(
@@ -969,19 +1007,20 @@ def _parse_prokka_gff_annotations(gff_path, gene_ids=None):
             if len(cols) < 9 or cols[2] != "CDS":
                 continue
             attrs = cols[8]
-            gene_id = ""
             product = "hypothetical protein"
             gene_name = ""
             locus_tag = ""
+            raw_id = ""
             for attr in attrs.split(";"):
-                if attr.startswith("ID="):
-                    gene_id = attr[3:]
+                if attr.startswith("ID=") and not raw_id:
+                    raw_id = attr[3:]
                 elif attr.startswith("product="):
                     product = attr[8:]
                 elif attr.startswith("gene="):
                     gene_name = attr[5:]
                 elif attr.startswith("locus_tag="):
                     locus_tag = attr[10:]
+            gene_id = _extract_gene_id(attrs)
             if gene_ids is None or gene_id in gene_ids:
                 annotations[gene_id] = {
                     "product": product,
