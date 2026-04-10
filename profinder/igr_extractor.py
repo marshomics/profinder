@@ -15,15 +15,10 @@ Orientation labels mirror PIGGY's convention:
     DP     ← IGR →        divergent promoter  (genes point away from IGR)
     CONV   → IGR ←        convergent / terminator (genes point into IGR)
 """
-import gzip
+
 import pandas as pd
 from Bio import SeqIO
 
-def _open_maybe_gzip(path):
-    path = str(path)
-    if path.endswith(".gz"):
-        return gzip.open(path, "rt")
-    return open(path, "r")
 
 def _classify_orientation(left_strand: str, right_strand: str) -> str:
     """Return PIGGY-compatible orientation label for a gene pair."""
@@ -38,10 +33,19 @@ def _classify_orientation(left_strand: str, right_strand: str) -> str:
 
 
 def _parse_gene_id(attributes: str) -> str:
-    """Extract ID= value from GFF attributes column."""
-    for attr in attributes.split(";"):
-        if attr.startswith("ID="):
-            return attr[3:]
+    """Extract a gene identifier from GFF attributes.
+
+    Tries, in order: ID=, locus_tag=, gene=, Name= (stripping any
+    trailing ' gene' or ' CDS' suffix from Geneious-style names).
+    """
+    for key in ("ID=", "locus_tag=", "gene=", "Name="):
+        for attr in attributes.split(";"):
+            if attr.startswith(key):
+                val = attr[len(key):]
+                for suffix in (" gene", " CDS"):
+                    if val.endswith(suffix):
+                        val = val[:-len(suffix)]
+                return val
     return ""
 
 
@@ -64,10 +68,7 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
                  left_gene, right_gene, sequence
     """
     # Load contig sequences
-    # contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
-    with _open_maybe_gzip(fasta_path) as fh:
-        contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(fh, "fasta")}
-
+    contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
 
     # Parse CDS entries from the GFF
     genes = []
