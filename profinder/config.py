@@ -22,26 +22,17 @@ class Config:
     # ── Tool paths ───────────────────────────────────────────────────
     prokka_bin: str = "prokka"
     hmmsearch_bin: str = "hmmsearch"
-    fimo_bin: str = "fimo"
     conda_env_prokka: str = ""   # leave blank to skip conda activate
     conda_env_hmm: str = ""
-    conda_env_meme: str = ""
 
     # ── HMM profiles directory (bundled by default) ────────────────
     hmm_profiles_dir: Path = None
 
     def __post_init__(self):
-        """Resolve bundled HMM and weight paths if none were provided."""
+        """Resolve bundled HMM path if none was provided."""
         if self.hmm_profiles_dir is None:
             candidate = Path(__file__).parent / "hmms"
             self.hmm_profiles_dir = candidate if candidate.is_dir() else None
-        if self.lcnn_weights_dir is None:
-            candidate = Path(__file__).parent / "weights" / "PromoterLCNN"
-            self.lcnn_weights_dir = candidate if candidate.is_dir() else None
-        if self.ipromarchaea_weights is None:
-            candidate = (Path(__file__).parent / "weights" / "iPromArchaea"
-                         / "model_cnn.weights.h5")
-            self.ipromarchaea_weights = candidate if candidate.exists() else None
 
         # Normalise domain to lowercase
         self.domain = self.domain.lower()
@@ -66,18 +57,14 @@ class Config:
     # ── HMM filtering ────────────────────────────────────────────────
     hmm_bitscore_min: float = 25.0
 
-    # ── PromoterLCNN parameters (bacteria) ──────────────────────────────
-    lcnn_weights_dir: Path = None     # parent dir containing IsPromoter_fold_5/ and PromotersOnly_fold_1/
-
-    # ── iProm-Archaea parameters (archaea) ───────────────────────────
-    ipromarchaea_weights: Path = None  # .h5 weights file for the archaeal CNN
-
     # ── CDS extension ────────────────────────────────────────────────
     cds_bp: int = 0                   # number of CDS-start nt to append (0 = disabled)
 
-    # ── FIMO parameters ──────────────────────────────────────────────
+    # ── Motif scanning parameters ────────────────────────────────────
     motifs_dir: Path = None           # directory containing .meme files
-    fimo_threshold: float = 1e-4     # p-value threshold for motif hits
+    motif_p10: float = 2.5e-3        # p-value threshold for -10 hits
+    motif_p35: float = 2.5e-3        # p-value threshold for -35 hits (strict)
+    motif_p35_relaxed: float = 0.05  # relaxed -35 threshold when ext -10 present
 
     # ── Derived paths ────────────────────────────────────────────────
     @property
@@ -177,23 +164,34 @@ class Config:
     def is_archaea(self) -> bool:
         return self.domain == "archaea"
 
-    # ── Promoter prediction output ────────────────────────────────────
+    # ── Motif scan output ────────────────────────────────────────────
     @property
-    def lcnn_predictions(self) -> Path:
-        return self.output_dir / "lcnn_predictions.tsv"
+    def motif_hits_all(self) -> Path:
+        return self.output_dir / "motif_hits_all.tsv"
+
+    @property
+    def motif_best_all(self) -> Path:
+        return self.output_dir / "motif_best_all.tsv"
+
+    @property
+    def motif_hits_markers(self) -> Path:
+        return self.output_dir / "motif_hits_markers.tsv"
+
+    @property
+    def motif_best_markers(self) -> Path:
+        return self.output_dir / "motif_best_markers.tsv"
 
     @property
     def promoter_markers_verified(self) -> Path:
         return self.output_dir / "promoter_markers_verified.tsv"
 
-    # ── FIMO output ───────────────────────────────────────────────────
     @property
-    def fimo_dir(self) -> Path:
-        return self.output_dir / "fimo"
+    def all_promoters_verified_fasta(self) -> Path:
+        return self.output_dir / "all_promoters_verified.fasta"
 
     @property
-    def fimo_combined(self) -> Path:
-        return self.fimo_dir / "fimo_combined.tsv"
+    def marker_promoters_verified_fasta(self) -> Path:
+        return self.output_dir / "marker_promoters_verified.fasta"
 
     # ── Final output table ─────────────────────────────────────────────
     @property
@@ -208,5 +206,5 @@ class Config:
     def ensure_dirs(self):
         """Create all output directories."""
         for d in [self.output_dir, self.prokka_dir, self.igr_dir,
-                  self.hmm_dir, self.fimo_dir]:
+                  self.hmm_dir]:
             d.mkdir(parents=True, exist_ok=True)
