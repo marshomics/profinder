@@ -4,11 +4,9 @@ ProFinder extracts high-confidence constitutive promoter candidates from bacteri
 
 ## How the pipeline works
 
-ProFinder applies a series of biologically motivated filters to identify promoter sequences upstream of single-copy phylogenetic marker genes: ribosomal proteins, tRNA synthetases, DNA replication components, and similar housekeeping functions. These genes are constitutively expressed because the cell cannot afford to silence them, so their promoters are strong candidates for driving reliable expression.
+ProFinder applies a series of biologically motivated filters to identify promoter sequences upstream of single-copy phylogenetic marker genes that are conserved in diverse bacteria: ribosomal proteins, tRNA synthetases, DNA replication components, and similar housekeeping functions.
 
-The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions between annotated CDS features, identifies operons using a two-pass proximity/flanking-distance algorithm, and screens for marker genes via hmmsearch against 838 bundled HMM profiles. Candidate promoters are verified by scanning for −10 and −35 hexamer motifs using position weight matrices from three curated databases (CollecTF, PRODORIC, RegTransBase). A final HTML report and comprehensive results table are generated.
-
-Promoter verification relies on the conservation of core σ70-type promoter architecture: the −10 (TATAAT) and −35 (TTGACA) hexamers separated by a 15–19 bp spacer. In benchmarking across eleven species spanning seven phyla, ProFinder returned useful promoter shortlists for every species with intergenic GC content below 50%, including organisms as distant from *E. coli* as *Bacillus subtilis* (Firmicutes), *Synechocystis* sp. PCC 6803 (Cyanobacteria), and *Vibrio cholerae* (Vibrionaceae). For genomes with intergenic GC content above approximately 60%, the AT-rich motifs that define σ70 promoters are genuinely sparse, and the pipeline returns fewer or no verified promoters.
+The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka), extracts intergenic regions between annotated CDS features, identifies operons using a two-pass proximity/flanking-distance algorithm, and screens for marker genes via hmmsearch against 98 curated HMM profiles. Candidate promoters are then verified by scanning for −10 and −35 hexamer motifs separated by a 15–19 bp spacer. A final HTML report and comprehensive results table are generated.
 
 ## Requirements
 
