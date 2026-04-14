@@ -10,7 +10,7 @@ The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka
 
 ## Requirements
 
-ProFinder needs Python ≥ 3.9 and two bioinformatics tools: [Prokka](https://github.com/tseemann/prokka) and [HMMER](http://hmmer.org/) (specifically `hmmsearch`). HMM profiles and motif databases are bundled with the package. No external CNN weights or MEME Suite tools are required.
+ProFinder needs Python ≥ 3.9, [Prokka](https://github.com/tseemann/prokka), and [HMMER](http://hmmer.org/) (specifically `hmmsearch`). HMM profiles and motif databases are bundled with the package.
 
 Python dependencies: `pandas ≥ 1.3`, `biopython ≥ 1.79`.
 
