@@ -6,9 +6,9 @@ Takes a single genome FASTA, annotates it with Prokka, extracts
 intergenic regions, identifies operons, screens for HMM marker genes,
 and outputs promoter sequences in 5'-to-3' orientation.
 
-Use ``--domain bacteria`` (default) for σ70 promoter prediction via
-PromoterLCNN, or ``--domain archaea`` for binary promoter prediction
-via iProm-Archaea.
+Use ``--domain bacteria`` (default) or ``--domain archaea``.
+Promoter verification is performed by scanning for -10/-35 hexamer
+motifs using position weight matrices from bundled MEME databases.
 
 Usage
 -----
@@ -42,18 +42,19 @@ Steps
     7.  Match IGRs to marker operons
     8.  Extract promoter sequences (marker-filtered)
     9.  Extract all promoter sequences (orientation-based, no HMM filter)
-    10. Predict promoters (PromoterLCNN for bacteria, iProm-Archaea for archaea)
+    10. Scan promoter motifs (-10/-35 hexamer verification)
     11. Annotate associated CDS (Prokka product names, gene, locus tag)
-    12. Scan promoters for motifs (FIMO)
-    13. Build final output table (all promoters, all metadata)
-    14. Generate HTML report
+    12. Build final output table (all promoters, all metadata)
+    13. Generate HTML report
 """
 
 import argparse
 import html as html_mod
+import math
 import re
 import subprocess
 import sys
+from itertools import product as iprod
 from pathlib import Path
 
 import pandas as pd
@@ -61,6 +62,279 @@ from Bio.Seq import Seq
 
 from .config import Config
 from .igr_extractor import extract_igrs
+
+
+# =====================================================================
+#  Motif scanning helpers (adapted from meme_scan.py)
+# =====================================================================
+
+_MOTIF_WIDTH = 6
+_SPACER_MIN = 15
+_SPACER_MAX = 19
+_BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+
+def _parse_meme_file(filepath):
+    """Parse a MEME-format file. Returns {motif_name: [[pA, pC, pG, pT], ...]}."""
+    motifs = {}
+    current = None
+    matrix = []
+    in_matrix = False
+
+    with open(filepath) as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith("MOTIF "):
+                if current and matrix:
+                    motifs[current] = matrix
+                current = line.split()[1]
+                matrix = []
+                in_matrix = False
+            elif line.startswith("letter-probability matrix"):
+                in_matrix = True
+            elif in_matrix:
+                if not line:
+                    in_matrix = False
+                    continue
+                vals = line.split()
+                if len(vals) == 4:
+                    try:
+                        matrix.append([float(v) for v in vals])
+                    except ValueError:
+                        in_matrix = False
+                else:
+                    in_matrix = False
+
+    if current and matrix:
+        motifs[current] = matrix
+    return motifs
+
+
+def _freq_to_log_odds(freq_matrix, bg=0.25, pseudocount=1e-6):
+    """Convert frequency matrix to log2-odds scoring matrix."""
+    return [[math.log2(max(f, pseudocount) / bg) for f in row]
+            for row in freq_matrix]
+
+
+def _compute_score_threshold(log_odds_matrix, p_value):
+    """Compute score threshold for a given p-value by enumerating all 4^w k-mers."""
+    w = len(log_odds_matrix)
+    scores = sorted(
+        [sum(log_odds_matrix[i][b] for i, b in enumerate(kmer))
+         for kmer in iprod(range(4), repeat=w)],
+        reverse=True,
+    )
+    rank = max(0, min(int(math.ceil(p_value * len(scores))) - 1, len(scores) - 1))
+    return scores[rank]
+
+
+def _score_kmer(seq, pos, log_odds_matrix):
+    """Score a 6-mer at the given position. Returns None if non-ACGT bases present."""
+    s = 0.0
+    for j in range(_MOTIF_WIDTH):
+        idx = _BASE_IDX.get(seq[pos + j])
+        if idx is None:
+            return None
+        s += log_odds_matrix[j][idx]
+    return s
+
+
+class _MotifSet:
+    """A collection of species motifs for one element type (-10 or -35),
+    each with its own log-odds matrix and score threshold."""
+
+    def __init__(self):
+        self.entries = []  # list of (source, log_odds_matrix, threshold)
+
+    def add(self, source, freq_matrix, p_value):
+        lom = _freq_to_log_odds(freq_matrix)
+        thresh = _compute_score_threshold(lom, p_value)
+        self.entries.append((source, lom, thresh))
+
+    def best_hit(self, seq, pos):
+        """Return (score, source) of the best-scoring motif that exceeds its
+        threshold at this position, or None."""
+        best = None
+        for source, lom, thresh in self.entries:
+            s = _score_kmer(seq, pos, lom)
+            if s is not None and s >= thresh:
+                if best is None or s > best[0]:
+                    best = (s, source)
+        return best
+
+
+def _load_motif_sets(motifs_dir, p10, p35_strict, p35_relaxed):
+    """Load all .meme files and build MotifSets for -10 and -35 elements."""
+    m10 = _MotifSet()
+    m35_strict = _MotifSet()
+    m35_relaxed = _MotifSet()
+
+    meme_files = sorted(Path(motifs_dir).glob("*.meme"))
+    if not meme_files:
+        print(f"  WARNING: no .meme files in {motifs_dir}", file=sys.stderr)
+        return m10, m35_strict, m35_relaxed
+
+    for mf in meme_files:
+        source = mf.stem
+        motifs = _parse_meme_file(mf)
+        if "Minus10" in motifs:
+            m10.add(source, motifs["Minus10"], p10)
+        if "Minus35" in motifs:
+            m35_strict.add(source, motifs["Minus35"], p35_strict)
+            m35_relaxed.add(source, motifs["Minus35"], p35_relaxed)
+
+    n10 = len(m10.entries)
+    n35 = len(m35_strict.entries)
+    print(f"  Loaded {n10} Minus10 and {n35} Minus35 motifs from "
+          f"{len(meme_files)} files")
+    return m10, m35_strict, m35_relaxed
+
+
+def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
+    """Scan one strand for promoter candidates. Returns list of result dicts."""
+    w = _MOTIF_WIDTH
+    max_pos = len(seq) - w
+
+    # Pre-scan all -10 hits
+    hits_10 = []
+    for i in range(max_pos + 1):
+        hit = m10.best_hit(seq, i)
+        if hit:
+            hits_10.append((i, hit[0], hit[1]))
+
+    if not hits_10:
+        return []
+
+    # Pre-scan all -35 hits at both thresholds (indexed by position)
+    strict_by_pos = {}
+    relaxed_by_pos = {}
+    for i in range(max_pos + 1):
+        hit_s = m35_strict.best_hit(seq, i)
+        if hit_s:
+            strict_by_pos[i] = hit_s
+        hit_r = m35_relaxed.best_hit(seq, i)
+        if hit_r:
+            relaxed_by_pos[i] = hit_r
+
+    results = []
+    for pos_10, score_10, source_10 in hits_10:
+        # Extended -10 check
+        has_ext10 = pos_10 >= 2 and seq[pos_10 - 2:pos_10] == "TG"
+
+        best_35 = None
+        path = None
+
+        # Path A: strict -35 + spacing
+        for spacer in range(_SPACER_MIN, _SPACER_MAX + 1):
+            p35 = pos_10 - w - spacer
+            if p35 < 0:
+                continue
+            if p35 in strict_by_pos:
+                s35, src35 = strict_by_pos[p35]
+                if best_35 is None or s35 > best_35[0]:
+                    best_35 = (s35, src35, p35, spacer)
+                    path = "A"
+
+        # Path B: extended -10 with relaxed or absent -35
+        if best_35 is None and has_ext10:
+            for spacer in range(_SPACER_MIN, _SPACER_MAX + 1):
+                p35 = pos_10 - w - spacer
+                if p35 < 0:
+                    continue
+                if p35 in relaxed_by_pos:
+                    s35, src35 = relaxed_by_pos[p35]
+                    if best_35 is None or s35 > best_35[0]:
+                        best_35 = (s35, src35, p35, spacer)
+                        path = "B_with_35"
+
+            if best_35 is None:
+                path = "B_no_35"
+
+        if path is None:
+            continue
+
+        r = {
+            "pos_10": pos_10,
+            "seq_10": seq[pos_10:pos_10 + w],
+            "score_10": round(score_10, 3),
+            "source_10": source_10,
+            "has_ext10": has_ext10,
+            "path": path,
+        }
+
+        if best_35 is not None:
+            s35, src35, p35, spacer = best_35
+            r["pos_35"] = p35
+            r["seq_35"] = seq[p35:p35 + w]
+            r["score_35"] = round(s35, 3)
+            r["source_35"] = src35
+            r["spacer_len"] = spacer
+            r["spacer_seq"] = seq[p35 + w:pos_10]
+        else:
+            r["pos_35"] = "."
+            r["seq_35"] = "."
+            r["score_35"] = "."
+            r["source_35"] = "."
+            r["spacer_len"] = "."
+            r["spacer_seq"] = "."
+
+        results.append(r)
+
+    return results
+
+
+_MOTIF_COLUMNS = [
+    "strand", "pos_10", "seq_10", "score_10", "source_10",
+    "has_ext10", "pos_35", "seq_35", "score_35", "source_35",
+    "spacer_len", "spacer_seq", "path",
+]
+
+_PATH_RANK = {"A": 0, "B_with_35": 1, "B_no_35": 2}
+
+
+def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
+                               seq_col="sequence_5p_to_3p",
+                               id_col="igr_id"):
+    """Scan a DataFrame of sequences for -10/-35 promoter motifs.
+
+    Returns two DataFrames:
+        all_hits  — every motif hit found (multiple rows per sequence possible)
+        best_hits — one row per sequence, keeping the best hit (Path A > B_with_35 > B_no_35,
+                     then highest -10 score)
+    """
+    all_rows = []
+    best_per_seq = {}  # igr_id -> (path_rank, neg_score_10, row_dict)
+
+    for _, row in df.iterrows():
+        raw = row[seq_col]
+        if not isinstance(raw, str) or not raw:
+            continue
+        raw = raw.upper()
+        igr_id = row[id_col]
+
+        def _revcomp(s):
+            comp = str.maketrans("ACGTacgt", "TGCAtgca")
+            return s.translate(comp)[::-1]
+
+        for strand, seq in [("+", raw), ("-", _revcomp(raw))]:
+            for r in _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
+                out = {id_col: igr_id, "strand": strand}
+                for k in _MOTIF_COLUMNS:
+                    if k != "strand":
+                        out[k] = r.get(k, ".")
+                all_rows.append(out)
+
+                path_rank = _PATH_RANK.get(r["path"], 99)
+                s10 = r["score_10"] if isinstance(r["score_10"], float) else 0.0
+                prev = best_per_seq.get(igr_id)
+                if prev is None or (path_rank, -s10) < (prev[0], prev[1]):
+                    best_per_seq[igr_id] = (path_rank, -s10, out)
+
+    all_hits = pd.DataFrame(all_rows) if all_rows else pd.DataFrame(columns=[id_col] + _MOTIF_COLUMNS)
+    best_rows = [v[2] for v in best_per_seq.values()]
+    best_hits = pd.DataFrame(best_rows) if best_rows else pd.DataFrame(columns=[id_col] + _MOTIF_COLUMNS)
+
+    return all_hits, best_hits
 
 
 # =====================================================================
@@ -798,156 +1072,67 @@ def step09_extract_all_promoters(cfg: Config, force: bool = False):
 
 
 # =====================================================================
-#  Step 10 — Promoter prediction (final filter)
+#  Step 10 — Motif-based promoter filtering
 #
-#  Bacteria  → PromoterLCNN  (two-stage: binary + σ-factor subtype)
-#  Archaea   → iProm-Archaea (single-stage: binary only)
+#  Scans promoter sequences for -10 and -35 hexamer motifs using PWMs
+#  from bundled .meme files (collectf, prodoric, regtransbase).
+#  A sequence is confirmed as a promoter candidate if it has:
+#    Path A: -10 hit + -35 hit with 15-19 bp spacer
+#    Path B: -10 hit + extended -10 TG dinucleotide + relaxed/absent -35
 # =====================================================================
 
-def _step10_bacteria(cfg: Config, all_igr, force: bool = False):
-    """PromoterLCNN path — bacterial σ-factor classification."""
+def step10_scan_motifs(cfg: Config, force: bool = False):
+    """Scan promoter sequences for -10/-35 motifs and filter.
 
-    # Check weights availability
-    if cfg.lcnn_weights_dir is None or not cfg.lcnn_weights_dir.is_dir():
-        print("── PromoterLCNN weights not available, skipping prediction ──")
-        print("  Provide --lcnn-weights or reinstall to restore bundled weights.")
-        if cfg.igr_summary.exists():
-            pd.DataFrame(columns=["igr_id", "prediction", "sigma_type"]).to_csv(
-                cfg.lcnn_predictions, sep="\t", index=False)
-        if cfg.promoter_markers.exists():
-            import shutil
-            shutil.copy2(cfg.promoter_markers, cfg.promoter_markers_verified)
-        return
-
-    # Trim to 3'-terminal 81 nt (closest to TSS / CDS start)
-    _LCNN_LEN = 81
-    seqs_81 = []
-    short_mask = []
-    for seq in all_igr["sequence_5p_to_3p"]:
-        if isinstance(seq, str) and len(seq) >= _LCNN_LEN:
-            seqs_81.append(seq[-_LCNN_LEN:])
-            short_mask.append(False)
-        else:
-            seqs_81.append(None)
-            short_mask.append(True)
-
-    n_short = sum(short_mask)
-    if n_short:
-        print(f"  {n_short} sequence(s) shorter than {_LCNN_LEN} nt — "
-              f"classified as NON_PROMOTER")
-
-    from .promoter_lcnn import load_models, predict as lcnn_predict, PromoterType
-
-    n_valid = len(seqs_81) - n_short
-    print(f"── Running PromoterLCNN on {n_valid} sequences ──")
-    models = load_models(
-        cfg.lcnn_weights_dir / "IsPromoter_fold_5",
-        cfg.lcnn_weights_dir / "PromotersOnly_fold_1",
-    )
-
-    valid_seqs = [s for s in seqs_81 if s is not None]
-    preds = lcnn_predict(models, valid_seqs) if valid_seqs else []
-
-    # Merge predictions back, filling short sequences as NON_PROMOTER
-    full_preds = []
-    pred_iter = iter(preds)
-    for is_short in short_mask:
-        if is_short:
-            full_preds.append(PromoterType.NON_PROMOTER)
-        else:
-            full_preds.append(next(pred_iter))
-
-    # Build predictions table
-    pred_rows = []
-    for i, (_, row) in enumerate(all_igr.iterrows()):
-        pt = full_preds[i]
-        pred_rows.append({
-            "igr_id": row["igr_id"],
-            "prediction": "PROMOTER" if pt != PromoterType.NON_PROMOTER else "NON_PROMOTER",
-            "sigma_type": pt.name,
-        })
-
-    return pred_rows
-
-
-def _step10_archaea(cfg: Config, all_igr, force: bool = False):
-    """iProm-Archaea path — binary archaeal promoter classification."""
-
-    # Check weights availability
-    if cfg.ipromarchaea_weights is None or not cfg.ipromarchaea_weights.exists():
-        print("── iProm-Archaea weights not available, skipping prediction ──")
-        print("  Provide --ipromarchaea-weights or reinstall to restore bundled weights.")
-        if cfg.igr_summary.exists():
-            pd.DataFrame(columns=["igr_id", "prediction", "sigma_type"]).to_csv(
-                cfg.lcnn_predictions, sep="\t", index=False)
-        if cfg.promoter_markers.exists():
-            import shutil
-            shutil.copy2(cfg.promoter_markers, cfg.promoter_markers_verified)
-        return
-
-    # iProm-Archaea scans sequences in non-overlapping 100 bp windows,
-    # classifying each window independently.  A sequence is called a
-    # promoter if ANY window scores positive.  Windows shorter than
-    # 80 bp are discarded, so sequences < 80 bp produce no windows and
-    # are classified as non-promoters.  The windowing and any-positive
-    # aggregation are handled inside arch_predict().
-    from .promoter_ipromarchaea import load_model, predict as arch_predict
-
-    # Sequences < 80 nt will yield no windows inside predict(), but we
-    # count them here for the log message.
-    _ARCHAEA_MIN = 80
-    n_short = sum(1 for seq in all_igr["sequence_5p_to_3p"]
-                  if not isinstance(seq, str) or len(seq) < _ARCHAEA_MIN)
-    if n_short:
-        print(f"  {n_short} sequence(s) shorter than {_ARCHAEA_MIN} nt — "
-              f"classified as NON_PROMOTER (no valid windows)")
-
-    seqs = list(all_igr["sequence_5p_to_3p"])
-    print(f"── Running iProm-Archaea on {len(seqs)} sequences "
-          f"(sliding 100 bp windows) ──")
-    model = load_model(cfg.ipromarchaea_weights)
-
-    full_preds = arch_predict(model, seqs)
-
-    # Build predictions table.  For archaea there are no sigma subtypes,
-    # so sigma_type is "PROMOTER" or "NON_PROMOTER" to stay consistent
-    # with the downstream column expectations.
-    pred_rows = []
-    for i, (_, row) in enumerate(all_igr.iterrows()):
-        is_prom = full_preds[i]
-        pred_rows.append({
-            "igr_id": row["igr_id"],
-            "prediction": "PROMOTER" if is_prom else "NON_PROMOTER",
-            "sigma_type": "PROMOTER" if is_prom else "NON_PROMOTER",
-        })
-
-    return pred_rows
-
-
-def step10_predict_promoters(cfg: Config, force: bool = False):
-    """Run promoter prediction on ALL promoter-orientation IGRs.
-
-    For bacteria, each sequence is trimmed to its 3'-terminal 81 nt and
-    classified by PromoterLCNN (binary + σ-factor subtype).
-
-    For archaea, each sequence is trimmed to its 3'-terminal 100 nt and
-    classified by iProm-Archaea (binary promoter/non-promoter only).
-
-    The step writes:
-
-    * ``lcnn_predictions.tsv`` — per-sequence predictions for every
-      promoter-orientation IGR.
-    * ``promoter_markers_verified.tsv`` — subset of marker promoters
-      confirmed by the CNN (used by the HTML report and downstream
-      annotation steps).
+    Writes:
+    * ``motif_hits_all.tsv``       — all hits for all promoter-orientation IGRs
+    * ``motif_best_all.tsv``       — best hit per IGR (all promoters)
+    * ``motif_hits_markers.tsv``   — all hits for marker promoters only
+    * ``motif_best_markers.tsv``   — best hit per IGR (markers only)
+    * ``promoter_markers_verified.tsv`` — marker promoters confirmed by motif scan
+    * ``all_promoters_verified.fasta``  — FASTA of all motif-confirmed promoters
+    * ``marker_promoters_verified.fasta`` — FASTA of marker motif-confirmed promoters
     """
-    if not force and cfg.lcnn_predictions.exists() and cfg.promoter_markers_verified.exists():
-        classifier = "iProm-Archaea" if cfg.is_archaea else "PromoterLCNN"
-        print(f"── {classifier} predictions already exist, skipping ──")
+    if not force and cfg.motif_best_all.exists() and cfg.promoter_markers_verified.exists():
+        print("── Motif scan results already exist, skipping ──")
         print("  Step 10 complete.\n")
         return
 
-    # Load ALL promoter-orientation IGRs
+    # Locate motifs directory
+    motifs_dir = cfg.motifs_dir
+    if motifs_dir is None or not motifs_dir.is_dir():
+        bundled = Path(__file__).parent / "motifs"
+        if bundled.is_dir():
+            motifs_dir = bundled
+        else:
+            print("── No motifs directory found, skipping motif scan ──")
+            pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
+            print("  Step 10 complete.\n")
+            return
+
+    # Load motif sets with configured p-value thresholds
+    p10 = cfg.motif_p10
+    p35 = cfg.motif_p35
+    p35_relaxed = cfg.motif_p35_relaxed
+    print(f"── Loading motifs (p10={p10}, p35={p35}, p35_relaxed={p35_relaxed}) ──")
+    m10, m35_strict, m35_relaxed = _load_motif_sets(motifs_dir, p10, p35, p35_relaxed)
+
+    if not m10.entries:
+        print("  No Minus10 motifs loaded — cannot scan.")
+        pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
+        print("  Step 10 complete.\n")
+        return
+
+    # Report thresholds
+    print("  Score thresholds:")
+    for source, lom, thresh in m10.entries:
+        print(f"    -10 [{source}]: >= {thresh:.3f} (p < {p10})")
+    for source, lom, thresh in m35_strict.entries:
+        print(f"    -35 strict [{source}]: >= {thresh:.3f} (p < {p35})")
+    for source, lom, thresh in m35_relaxed.entries:
+        print(f"    -35 relaxed [{source}]: >= {thresh:.3f} (p < {p35_relaxed})")
+
+    # --- Scan ALL promoter-orientation IGRs ---
     try:
         all_igr = pd.read_csv(cfg.igr_summary, sep="\t")
         all_igr = all_igr[all_igr["orientation"].isin(["CO_F", "CO_R"])].copy()
@@ -955,9 +1140,10 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
         all_igr = pd.DataFrame()
 
     if all_igr.empty:
-        print("── No promoter-orientation IGRs to classify ──")
-        pd.DataFrame(columns=["igr_id", "prediction", "sigma_type"]).to_csv(
-            cfg.lcnn_predictions, sep="\t", index=False)
+        print("── No promoter-orientation IGRs to scan ──")
+        for p in [cfg.motif_hits_all, cfg.motif_best_all,
+                  cfg.motif_hits_markers, cfg.motif_best_markers]:
+            pd.DataFrame().to_csv(p, sep="\t", index=False)
         pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
         print("  Step 10 complete.\n")
         return
@@ -969,47 +1155,78 @@ def step10_predict_promoters(cfg: Config, force: bool = False):
         axis=1,
     )
 
-    # Dispatch to domain-specific classifier
-    if cfg.is_archaea:
-        pred_rows = _step10_archaea(cfg, all_igr, force=force)
-    else:
-        pred_rows = _step10_bacteria(cfg, all_igr, force=force)
+    print(f"\n  Scanning {len(all_igr)} promoter-orientation IGRs...")
+    all_hits, best_all = _scan_sequences_for_motifs(
+        all_igr, m10, m35_strict, m35_relaxed)
 
-    if pred_rows is None:
-        # Weights were missing; helper already wrote fallback files.
-        print("  Step 10 complete.\n")
-        return
+    all_hits.to_csv(cfg.motif_hits_all, sep="\t", index=False)
+    best_all.to_csv(cfg.motif_best_all, sep="\t", index=False)
+    n_confirmed_all = len(best_all)
+    print(f"  All promoters: {n_confirmed_all}/{len(all_igr)} confirmed by motif scan")
+    print(f"    All hits -> {cfg.motif_hits_all}")
+    print(f"    Best hits -> {cfg.motif_best_all}")
 
-    pred_df = pd.DataFrame(pred_rows)
-    pred_df.to_csv(cfg.lcnn_predictions, sep="\t", index=False)
+    # Write verified all-promoter FASTA
+    confirmed_ids = set(best_all["igr_id"])
+    confirmed_all_df = all_igr[all_igr["igr_id"].isin(confirmed_ids)].copy()
+    _write_fasta(confirmed_all_df, cfg.all_promoters_verified_fasta, short_header=False)
 
-    n_promoter = sum(1 for r in pred_rows if r["prediction"] == "PROMOTER")
-    n_non = len(pred_rows) - n_promoter
-    print(f"  Predicted: {n_promoter} promoter(s), {n_non} non-promoter(s)")
-    print(f"  Predictions -> {cfg.lcnn_predictions}")
-
-    # Write verified markers: intersection of marker promoters and CNN-positive
+    # --- Scan MARKER promoters ---
     marker_igr_ids = set()
+    markers_df = pd.DataFrame()
     try:
         markers_df = pd.read_csv(cfg.promoter_markers, sep="\t")
-        markers_df = markers_df[markers_df["orientation"].isin(["CO_F", "CO_R"])]
+        markers_df = markers_df[markers_df["orientation"].isin(["CO_F", "CO_R"])].copy()
         marker_igr_ids = set(markers_df["igr_id"])
     except (FileNotFoundError, pd.errors.EmptyDataError):
         pass
 
-    cnn_positive = set(r["igr_id"] for r in pred_rows if r["prediction"] == "PROMOTER")
-    verified_ids = marker_igr_ids & cnn_positive
+    if markers_df.empty:
+        print("  No marker promoters to scan.")
+        for p in [cfg.motif_hits_markers, cfg.motif_best_markers]:
+            pd.DataFrame().to_csv(p, sep="\t", index=False)
+        pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
+        print("  Step 10 complete.\n")
+        return
 
-    sigma_map = {r["igr_id"]: r["sigma_type"] for r in pred_rows}
+    # Orient marker sequences 5'→3'
+    if "sequence_5p_to_3p" not in markers_df.columns:
+        markers_df["sequence_5p_to_3p"] = markers_df.apply(
+            lambda r: _reverse_complement(r["sequence"]) if r["orientation"] == "CO_R"
+            else r["sequence"],
+            axis=1,
+        )
 
-    if marker_igr_ids:
-        verified_df = markers_df[markers_df["igr_id"].isin(verified_ids)].copy()
-        verified_df["sigma_type"] = verified_df["igr_id"].map(sigma_map)
-    else:
-        verified_df = pd.DataFrame()
+    print(f"\n  Scanning {len(markers_df)} marker promoters...")
+    marker_hits, best_markers = _scan_sequences_for_motifs(
+        markers_df, m10, m35_strict, m35_relaxed)
+
+    marker_hits.to_csv(cfg.motif_hits_markers, sep="\t", index=False)
+    best_markers.to_csv(cfg.motif_best_markers, sep="\t", index=False)
+
+    # Write verified markers: marker promoters that passed motif scan
+    verified_ids = set(best_markers["igr_id"])
+    verified_df = markers_df[markers_df["igr_id"].isin(verified_ids)].copy()
+
+    # Merge best motif hit info onto verified markers
+    motif_info = best_markers.set_index("igr_id")[
+        ["strand", "pos_10", "seq_10", "score_10", "source_10",
+         "has_ext10", "pos_35", "seq_35", "score_35", "source_35",
+         "spacer_len", "spacer_seq", "path"]
+    ].rename(columns=lambda c: f"motif_{c}")
+    verified_df = verified_df.merge(motif_info, left_on="igr_id",
+                                     right_index=True, how="left")
 
     verified_df.to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
-    print(f"  Verified markers ({len(verified_df)} rows) -> {cfg.promoter_markers_verified}")
+    n_confirmed_markers = len(verified_df)
+    print(f"  Marker promoters: {n_confirmed_markers}/{len(markers_df)} confirmed")
+    print(f"    Marker hits -> {cfg.motif_hits_markers}")
+    print(f"    Best marker hits -> {cfg.motif_best_markers}")
+    print(f"    Verified markers -> {cfg.promoter_markers_verified}")
+
+    # Write verified marker promoter FASTA
+    _write_fasta(verified_df, cfg.marker_promoters_verified_fasta, short_header=False)
+
     print("  Step 10 complete.\n")
 
 
@@ -1114,102 +1331,6 @@ def step11_annotate_cds(cfg: Config, force: bool = False):
 
 
 # =====================================================================
-#  Step 12 — FIMO motif scanning
-# =====================================================================
-
-def step12_run_fimo(cfg: Config, force: bool = False):
-    """Scan promoter sequences against motif databases with FIMO."""
-    if not force and cfg.fimo_combined.exists():
-        print("── FIMO results already exist, skipping ──")
-        print("  Step 12 complete.\n")
-        return
-
-    # Determine which promoter FASTA to scan
-    fasta_to_scan = None
-    for candidate in [cfg.all_promoter_fasta, cfg.promoter_fasta]:
-        if candidate.exists() and candidate.stat().st_size > 0:
-            fasta_to_scan = candidate
-            break
-    if fasta_to_scan is None:
-        print("── No promoter FASTA files found, skipping ──")
-        print("  Step 12 complete.\n")
-        return
-
-    # Find .meme files
-    motifs_dir = cfg.motifs_dir
-    if motifs_dir is None or not motifs_dir.is_dir():
-        # Fall back to bundled motifs alongside this script
-        bundled = Path(__file__).parent / "motifs"
-        if bundled.is_dir():
-            motifs_dir = bundled
-        else:
-            print("── No motifs directory found, skipping ──")
-            print("  Step 12 complete.\n")
-            return
-
-    meme_files = sorted(motifs_dir.glob("*.meme"))
-    if not meme_files:
-        print(f"── No .meme files in {motifs_dir}, skipping ──")
-        print("  Step 12 complete.\n")
-        return
-
-    print(f"── Running FIMO against {len(meme_files)} motif databases ──")
-    print(f"  Scanning: {fasta_to_scan.name}")
-    cfg.fimo_dir.mkdir(parents=True, exist_ok=True)
-
-    all_fimo_dfs = []
-    for meme_file in meme_files:
-        db_name = meme_file.stem
-        out_subdir = cfg.fimo_dir / db_name
-        tsv_out = out_subdir / "fimo.tsv"
-
-        if not force and tsv_out.exists():
-            print(f"  {db_name}: already done")
-        else:
-            out_subdir.mkdir(parents=True, exist_ok=True)
-            parts = []
-            if cfg.conda_env_meme:
-                parts.append(
-                    f'eval "$(conda shell.bash hook 2>/dev/null)"; '
-                    f"conda activate {cfg.conda_env_meme}; "
-                )
-            parts.append(
-                f"{cfg.fimo_bin}"
-                f" --thresh {cfg.fimo_threshold}"
-                f" --oc {out_subdir}"
-                f" {meme_file}"
-                f" {fasta_to_scan}"
-            )
-            cmd = "set -euo pipefail; " + "".join(parts)
-            result = subprocess.run(["bash", "-c", cmd],
-                                    capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"  WARNING: FIMO {db_name} failed: {result.stderr[-300:]}")
-                continue
-            print(f"  {db_name}: done")
-
-        # Parse FIMO TSV output
-        if tsv_out.exists():
-            try:
-                fimo_df = pd.read_csv(tsv_out, sep="\t", comment="#")
-                if not fimo_df.empty:
-                    fimo_df["motif_database"] = db_name
-                    all_fimo_dfs.append(fimo_df)
-            except pd.errors.EmptyDataError:
-                pass
-
-    if all_fimo_dfs:
-        combined = pd.concat(all_fimo_dfs, ignore_index=True)
-        combined.to_csv(cfg.fimo_combined, sep="\t", index=False)
-        print(f"  Combined FIMO hits ({len(combined)} rows) -> {cfg.fimo_combined}")
-    else:
-        print("  No FIMO hits found across any database.")
-        pd.DataFrame().to_csv(cfg.fimo_combined, sep="\t", index=False)
-
-    print("  Step 12 complete.\n")
-
-
-# =====================================================================
 #  Step 14 — HTML report
 # =====================================================================
 
@@ -1236,12 +1357,11 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50):
     bar_w = width - 2 * margin
     scale = bar_w / seq_len
 
-    # Colour palette for motif databases
+    # Colour palette for motif elements
     db_colours = {
-        "collectf": "#2196F3",
-        "prodoric_2021.9": "#FF9800",
-        "prodoric_2021": "#FF9800",
-        "regtransbase": "#4CAF50",
+        "minus35": "#1565c0",
+        "minus10": "#c62828",
+        "ext10": "#ff8f00",
     }
     default_colour = "#9C27B0"
 
@@ -1282,15 +1402,15 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50):
 
 def step14_generate_report(cfg: Config, force: bool = False):
     """Generate an HTML report combining promoters, CDS annotations,
-    and motif hits with visual sequence diagrams."""
+    and motif hit positions with visual sequence diagrams."""
     if not force and cfg.report_html.exists():
         print("── HTML report already exists, skipping ──")
-        print("  Step 14 complete.\n")
+        print("  Step 13 complete.\n")
         return
 
     print("── Generating HTML report ──")
 
-    # Load verified promoters (after CNN filter).
+    # Load verified promoters (after motif scan).
     # Falls back to promoter_markers if verified file doesn't exist.
     source_file = cfg.promoter_markers_verified if cfg.promoter_markers_verified.exists() else cfg.promoter_markers
     promoter_df = None
@@ -1305,17 +1425,7 @@ def step14_generate_report(cfg: Config, force: bool = False):
 
     if promoter_df is None or promoter_df.empty:
         print("  No verified promoter data available for report.")
-        print("  Step 14 complete.\n")
-        return
-
-    # For bacteria, filter to σ70 promoters only.
-    # For archaea, keep all CNN-confirmed promoters (no sigma subtypes).
-    if not cfg.is_archaea and "sigma_type" in promoter_df.columns:
-        promoter_df = promoter_df[promoter_df["sigma_type"] == "SIGMA_70"].copy()
-    if promoter_df.empty:
-        label = "promoters" if cfg.is_archaea else "σ70 promoters"
-        print(f"  No {label} found for report.")
-        print("  Step 14 complete.\n")
+        print("  Step 13 complete.\n")
         return
 
     # Count all promoter-orientation IGRs for reference
@@ -1348,47 +1458,9 @@ def step14_generate_report(cfg: Config, force: bool = False):
         except (pd.errors.EmptyDataError, KeyError):
             pass
 
-    # Load FIMO hits grouped by promoter
-    fimo_by_promoter = {}
-    if cfg.fimo_combined.exists():
-        try:
-            fimo_df = pd.read_csv(cfg.fimo_combined, sep="\t")
-            # FIMO output uses "sequence_name" for the FASTA header
-            seq_col = "sequence_name"
-            if seq_col not in fimo_df.columns:
-                # Try alternative column names
-                for alt in ["sequence name", "#pattern name"]:
-                    if alt in fimo_df.columns:
-                        seq_col = alt
-                        break
-
-            if seq_col in fimo_df.columns:
-                for seq_name, grp in fimo_df.groupby(seq_col):
-                    # Extract the igr_id from the FASTA header
-                    # Headers look like: igr_000001_contigX_CO_F_geneA_geneB
-                    m = re.match(r"(igr_\d+)", seq_name)
-                    igr_id = m.group(1) if m else seq_name.split("_")[0] + "_" + seq_name.split("_")[1]
-                    if igr_id not in fimo_by_promoter:
-                        fimo_by_promoter[igr_id] = []
-                    for _, hit in grp.iterrows():
-                        fimo_by_promoter[igr_id].append({
-                            "motif_id": str(hit.get("motif_id", hit.get("#pattern name", ""))),
-                            "motif_alt_id": str(hit.get("motif_alt_id", "")),
-                            "start": int(hit.get("start", 0)),
-                            "stop": int(hit.get("stop", 0)),
-                            "strand": str(hit.get("strand", "+")),
-                            "p-value": float(hit.get("p-value", 1)),
-                            "q-value": float(hit.get("q-value", 1)) if "q-value" in hit.index else None,
-                            "matched_sequence": str(hit.get("matched_sequence", "")),
-                            "motif_database": str(hit.get("motif_database", "")),
-                        })
-        except (pd.errors.EmptyDataError, KeyError):
-            pass
-
-    # Filter FIMO hits to only marker-filtered promoter IDs
-    marker_igr_ids = set(promoter_df["igr_id"])
-    fimo_by_promoter = {k: v for k, v in fimo_by_promoter.items()
-                        if k in marker_igr_ids}
+    # Build motif hit info from verified markers (motif_pos_10, motif_pos_35, etc.)
+    # These columns were added by step 10 when writing promoter_markers_verified.tsv
+    has_motif_cols = "motif_pos_10" in promoter_df.columns
 
     # Build HTML
     n_promoters = len(promoter_df)
@@ -1396,7 +1468,8 @@ def step14_generate_report(cfg: Config, force: bool = False):
                       if r["associated_gene"] in annotation_map
                       and annotation_map[r["associated_gene"]] != "hypothetical protein")
     n_with_motifs = sum(1 for _, r in promoter_df.iterrows()
-                        if r["igr_id"] in fimo_by_promoter)
+                        if has_motif_cols and pd.notna(r.get("motif_pos_10"))
+                        and str(r.get("motif_pos_10")) != ".")
 
     genome_name = cfg.input_fasta.stem
 
@@ -1406,10 +1479,6 @@ def step14_generate_report(cfg: Config, force: bool = False):
     promoters_fasta_name = cfg.promoter_fasta.name if cfg.promoter_fasta.exists() else ""
     final_table_name = cfg.final_table.name if cfg.final_table.exists() else ""
 
-    # Domain-aware labels
-    promoter_type_label = "promoters" if cfg.is_archaea else "σ70 promoters"
-    promoter_type_html = "promoters" if cfg.is_archaea else "&sigma;70 promoters"
-    classifier_name = "iProm-Archaea" if cfg.is_archaea else "PromoterLCNN"
     domain_label = "Archaea" if cfg.is_archaea else "Bacteria"
 
     html_parts = [_REPORT_HTML_HEAD.format(
@@ -1418,30 +1487,25 @@ def step14_generate_report(cfg: Config, force: bool = False):
         n_all_promoters=n_all_promoters,
         n_annotated=n_annotated,
         n_with_motifs=n_with_motifs,
-        total_fimo=sum(len(v) for v in fimo_by_promoter.values()),
         all_promoters_fasta=html_mod.escape(all_promo_name),
         verified_tsv=html_mod.escape(verified_tsv_name),
         promoters_fasta=html_mod.escape(promoters_fasta_name),
         final_table=html_mod.escape(final_table_name),
-        promoter_type_html=promoter_type_html,
-        promoter_type_label=promoter_type_label,
-        classifier_name=classifier_name,
         domain_label=domain_label,
     )]
 
-    # Legend
+    # Legend for motif diagram
     html_parts.append("""
     <div class="legend">
-        <strong>Motif database colours:</strong>
-        <span class="legend-item"><span class="legend-swatch" style="background:#2196F3"></span>CollecTF</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#FF9800"></span>PRODORIC</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#4CAF50"></span>RegTransBase</span>
+        <strong>Motif diagram:</strong>
+        <span class="legend-item"><span class="legend-swatch" style="background:#1565c0"></span>&minus;35 element</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#c62828"></span>&minus;10 element</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#ff8f00"></span>Extended &minus;10 (TG)</span>
     </div>
     """)
 
     # Table
-    sigma_col_header = "Classification" if cfg.is_archaea else "Sigma type"
-    html_parts.append(f"""
+    html_parts.append("""
     <table>
     <thead>
     <tr>
@@ -1450,11 +1514,14 @@ def step14_generate_report(cfg: Config, force: bool = False):
         <th>Position</th>
         <th>Length</th>
         <th>Orientation</th>
-        <th>{sigma_col_header}</th>
+        <th>Motif path</th>
+        <th>&minus;10</th>
+        <th>&minus;35</th>
+        <th>Spacer</th>
         <th>Associated CDS</th>
         <th>Protein</th>
         <th>Sequence diagram</th>
-        <th>Sequence (5'→3')</th>
+        <th>Sequence (5'&rarr;3')</th>
     </tr>
     </thead>
     <tbody>
@@ -1464,15 +1531,68 @@ def step14_generate_report(cfg: Config, force: bool = False):
         igr_id = row["igr_id"]
         gene = row["associated_gene"]
         product = annotation_map.get(gene, "")
-        motif_hits = fimo_by_promoter.get(igr_id, [])
+
+        # Build motif diagram from -10 and -35 positions
+        motif_hits = []
+        if has_motif_cols:
+            pos_10 = row.get("motif_pos_10", ".")
+            pos_35 = row.get("motif_pos_35", ".")
+            if pos_10 != "." and pd.notna(pos_10):
+                try:
+                    p10 = int(float(pos_10))
+                    motif_hits.append({
+                        "motif_id": "-10",
+                        "start": p10 + 1,  # 0-based to 1-based
+                        "stop": p10 + _MOTIF_WIDTH,
+                        "motif_database": "minus10",
+                    })
+                    # Extended -10 TG
+                    if str(row.get("motif_has_ext10", "")).lower() == "true":
+                        motif_hits.append({
+                            "motif_id": "ext-10 (TG)",
+                            "start": p10 - 1,  # TG is 2 nt before -10
+                            "stop": p10,
+                            "motif_database": "ext10",
+                        })
+                except (ValueError, TypeError):
+                    pass
+
+            if pos_35 != "." and pd.notna(pos_35):
+                try:
+                    p35 = int(float(pos_35))
+                    motif_hits.append({
+                        "motif_id": "-35",
+                        "start": p35 + 1,
+                        "stop": p35 + _MOTIF_WIDTH,
+                        "motif_database": "minus35",
+                    })
+                except (ValueError, TypeError):
+                    pass
 
         svg = _build_motif_diagram_svg(row["length"], motif_hits)
 
         orient_class = "co-f" if row["orientation"] == "CO_F" else "co-r"
         seq = row.get("sequence_5p_to_3p", "")
-        sigma = str(row.get("sigma_type", "")) if pd.notna(row.get("sigma_type")) else ""
-        # Format sigma type for display (e.g. SIGMA_70 -> σ70)
-        sigma_display = sigma.replace("SIGMA_", "σ") if sigma.startswith("SIGMA_") else sigma
+
+        # Motif details
+        motif_path = str(row.get("motif_path", "")) if has_motif_cols else ""
+        seq_10 = str(row.get("motif_seq_10", "")) if has_motif_cols else ""
+        score_10 = row.get("motif_score_10", "") if has_motif_cols else ""
+        source_10 = str(row.get("motif_source_10", "")) if has_motif_cols else ""
+        seq_35 = str(row.get("motif_seq_35", "")) if has_motif_cols else ""
+        score_35 = row.get("motif_score_35", "") if has_motif_cols else ""
+        source_35 = str(row.get("motif_source_35", "")) if has_motif_cols else ""
+        spacer_len = row.get("motif_spacer_len", "") if has_motif_cols else ""
+
+        minus10_cell = f"{html_mod.escape(seq_10)}" if seq_10 and seq_10 != "." else '<span class="na">—</span>'
+        if score_10 and str(score_10) != ".":
+            minus10_cell += f' <small>({score_10}, {html_mod.escape(source_10)})</small>'
+
+        minus35_cell = f"{html_mod.escape(seq_35)}" if seq_35 and seq_35 != "." else '<span class="na">—</span>'
+        if score_35 and str(score_35) != ".":
+            minus35_cell += f' <small>({score_35}, {html_mod.escape(source_35)})</small>'
+
+        spacer_cell = str(spacer_len) if spacer_len and str(spacer_len) != "." else '<span class="na">—</span>'
 
         product_cell = html_mod.escape(product) if product else '<span class="na">—</span>'
 
@@ -1483,7 +1603,10 @@ def step14_generate_report(cfg: Config, force: bool = False):
             <td>{row['start']:,}–{row['end']:,}</td>
             <td>{row['length']}</td>
             <td><span class="orient {orient_class}">{row['orientation']}</span></td>
-            <td>{html_mod.escape(sigma_display) if sigma_display else '<span class="na">—</span>'}</td>
+            <td>{html_mod.escape(motif_path)}</td>
+            <td>{minus10_cell}</td>
+            <td>{minus35_cell}</td>
+            <td>{spacer_cell}</td>
             <td><code>{html_mod.escape(str(gene))}</code></td>
             <td>{product_cell}</td>
             <td>{svg}</td>
@@ -1498,7 +1621,7 @@ def step14_generate_report(cfg: Config, force: bool = False):
     with open(cfg.report_html, "w") as fh:
         fh.write("\n".join(html_parts))
     print(f"  Report -> {cfg.report_html}")
-    print("  Step 14 complete.\n")
+    print("  Step 13 complete.\n")
 
 
 # ── HTML template fragments ──────────────────────────────────────────
@@ -1558,7 +1681,7 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
     .co-f {{ background: #e3f2fd; color: #1565c0; }}
     .co-r {{ background: #fce4ec; color: #c62828; }}
     .na {{ color: #bbb; }}
-    .motif-detail td {{ font-size: 0.8rem; }}
+    small {{ color: #888; }}
     footer {{
         margin-top: 40px; padding-top: 16px;
         border-top: 1px solid #eee; font-size: 0.78rem; color: #999;
@@ -1570,27 +1693,26 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 <p style="color:#666; margin-bottom:4px;">Genome: <strong>{genome_name}</strong></p>
 
 <div class="summary">
-    <div class="stat"><div class="label">{promoter_type_html}</div><div class="value">{n_marker_promoters}</div></div>
+    <div class="stat"><div class="label">Verified marker promoters</div><div class="value">{n_marker_promoters}</div></div>
     <div class="stat"><div class="label">CDS annotated</div><div class="value">{n_annotated}</div></div>
-    <div class="stat"><div class="label">With motif hits</div><div class="value">{n_with_motifs}</div></div>
-    <div class="stat"><div class="label">Total motif hits</div><div class="value">{total_fimo}</div></div>
+    <div class="stat"><div class="label">With &minus;10/&minus;35 motifs</div><div class="value">{n_with_motifs}</div></div>
     <div class="stat"><div class="label">All promoter IGRs</div><div class="value">{n_all_promoters}</div></div>
 </div>
 
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
-    Domain: <strong>{domain_label}</strong> · Classifier: <strong>{classifier_name}</strong><br/>
-    This report shows the <strong>{n_marker_promoters}</strong> {promoter_type_label} (marker-filtered, CNN-confirmed).
+    Domain: <strong>{domain_label}</strong> · Verification: <strong>&minus;10/&minus;35 motif scan</strong><br/>
+    This report shows the <strong>{n_marker_promoters}</strong> marker-filtered promoters confirmed by &minus;10/&minus;35 motif scanning.
     A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome.
 </p>
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
     <strong>Downloads:</strong>
-    <a href="{promoters_fasta}">promoters.fasta</a> ·
-    <a href="{verified_tsv}">promoter_markers_verified.tsv</a> ·
-    <a href="{all_promoters_fasta}">all_promoters.fasta</a> ·
+    <a href="{promoters_fasta}">promoters.fasta</a> &middot;
+    <a href="{verified_tsv}">promoter_markers_verified.tsv</a> &middot;
+    <a href="{all_promoters_fasta}">all_promoters.fasta</a> &middot;
     <a href="{final_table}">profinder_results.tsv</a>
 </p>
 
-<h2>{promoter_type_html}</h2>
+<h2>Verified marker promoters</h2>
 """
 
 _REPORT_HTML_FOOT = """
@@ -1622,14 +1744,25 @@ def step13_final_table(cfg: Config, force: bool = False):
     locus_tag             Locus tag from Prokka GFF (locus_tag= attribute)
     product               Protein product name from Prokka GFF
     is_marker             Whether this IGR flanks a marker-operon gene
-    lcnn_prediction       PROMOTER or NON_PROMOTER
-    sigma_type            Sigma-factor subtype from PromoterLCNN
-    motif_hits            Semicolon-separated list of FIMO motif hits
+    motif_confirmed       Whether a -10/-35 motif combination was found
+    motif_path            Motif path (A, B_with_35, B_no_35)
+    motif_strand          Strand on which best motif hit was found
+    motif_pos_10          Position of -10 element in scanned sequence
+    motif_seq_10          Sequence of -10 element
+    motif_score_10        Log-odds score of -10 hit
+    motif_source_10       Database source of -10 hit
+    motif_has_ext10       Whether extended -10 TG dinucleotide is present
+    motif_pos_35          Position of -35 element
+    motif_seq_35          Sequence of -35 element
+    motif_score_35        Log-odds score of -35 hit
+    motif_source_35       Database source of -35 hit
+    motif_spacer_len      Spacer length between -35 and -10
+    motif_spacer_seq      Spacer sequence
     sequence_5p_to_3p     Full promoter sequence oriented 5'→3'
     """
     if not force and cfg.final_table.exists():
         print("── Final output table already exists, skipping ──")
-        print("  Step 13 complete.\n")
+        print("  Step 12 complete.\n")
         return
 
     print("── Building final output table ──")
@@ -1644,7 +1777,7 @@ def step13_final_table(cfg: Config, force: bool = False):
     if igr.empty:
         print("  No promoter-orientation IGRs found.")
         pd.DataFrame().to_csv(cfg.final_table, sep="\t", index=False)
-        print("  Step 13 complete.\n")
+        print("  Step 12 complete.\n")
         return
 
     # 2. Associated CDS
@@ -1689,59 +1822,35 @@ def step13_final_table(cfg: Config, force: bool = False):
             pass
     igr["is_marker"] = igr["igr_id"].isin(marker_igr_ids)
 
-    # 6. PromoterLCNN predictions
-    lcnn_map = {}   # igr_id -> {prediction, sigma_type}
-    if cfg.lcnn_predictions.exists():
+    # 6. Motif scan results (best hit per IGR from step 10)
+    motif_cols = ["strand", "pos_10", "seq_10", "score_10", "source_10",
+                  "has_ext10", "pos_35", "seq_35", "score_35", "source_35",
+                  "spacer_len", "spacer_seq", "path"]
+    motif_map = {}   # igr_id -> dict of motif columns
+    if cfg.motif_best_all.exists():
         try:
-            lcnn_df = pd.read_csv(cfg.lcnn_predictions, sep="\t")
-            for _, row in lcnn_df.iterrows():
-                lcnn_map[row["igr_id"]] = {
-                    "prediction": str(row.get("prediction", "")),
-                    "sigma_type": str(row.get("sigma_type", "")),
-                }
+            motif_df = pd.read_csv(cfg.motif_best_all, sep="\t")
+            for _, row in motif_df.iterrows():
+                motif_map[row["igr_id"]] = {c: row.get(c, "") for c in motif_cols}
         except (pd.errors.EmptyDataError, KeyError):
             pass
 
-    igr["lcnn_prediction"] = igr["igr_id"].map(
-        lambda g: lcnn_map.get(g, {}).get("prediction", ""))
-    igr["sigma_type"] = igr["igr_id"].map(
-        lambda g: lcnn_map.get(g, {}).get("sigma_type", ""))
+    igr["motif_confirmed"] = igr["igr_id"].isin(set(motif_map.keys()))
+    for c in motif_cols:
+        col_name = f"motif_{c}"
+        igr[col_name] = igr["igr_id"].map(
+            lambda g, _c=c: motif_map.get(g, {}).get(_c, ""))
 
-    # 7. FIMO motif hits (semicolon-separated summary per promoter)
-    fimo_summary = {}   # igr_id -> semicolon-separated motif names
-    if cfg.fimo_combined.exists():
-        try:
-            fimo_df = pd.read_csv(cfg.fimo_combined, sep="\t")
-            seq_col = "sequence_name"
-            if seq_col not in fimo_df.columns:
-                for alt in ["sequence name", "#pattern name"]:
-                    if alt in fimo_df.columns:
-                        seq_col = alt
-                        break
-            if seq_col in fimo_df.columns:
-                for seq_name, grp in fimo_df.groupby(seq_col):
-                    m = re.match(r"(igr_\d+)", seq_name)
-                    igr_id = m.group(1) if m else seq_name.split("_")[0] + "_" + seq_name.split("_")[1]
-                    names = []
-                    for _, hit in grp.iterrows():
-                        alt = str(hit.get("motif_alt_id", ""))
-                        mid = str(hit.get("motif_id", hit.get("#pattern name", "")))
-                        db = str(hit.get("motif_database", ""))
-                        pval = hit.get("p-value", "")
-                        label = alt if alt and alt != "nan" else mid
-                        names.append(f"{label}({db},p={pval})")
-                    fimo_summary[igr_id] = "; ".join(names)
-        except (pd.errors.EmptyDataError, KeyError):
-            pass
-
-    igr["motif_hits"] = igr["igr_id"].map(lambda g: fimo_summary.get(g, ""))
-
-    # 8. CDS-extended sequences (optional)
+    # 7. CDS-extended sequences (optional)
     columns = [
         "igr_id", "contig", "start", "end", "length", "orientation",
         "associated_cds", "gene_name", "locus_tag", "product",
-        "is_marker", "lcnn_prediction", "sigma_type",
-        "motif_hits", "sequence_5p_to_3p",
+        "is_marker", "motif_confirmed", "motif_path", "motif_strand",
+        "motif_pos_10", "motif_seq_10", "motif_score_10", "motif_source_10",
+        "motif_has_ext10",
+        "motif_pos_35", "motif_seq_35", "motif_score_35", "motif_source_35",
+        "motif_spacer_len", "motif_spacer_seq",
+        "sequence_5p_to_3p",
     ]
 
     if cfg.cds_bp > 0:
@@ -1749,13 +1858,13 @@ def step13_final_table(cfg: Config, force: bool = False):
         igr = _add_cds_column(igr, contigs, cfg.cds_bp)
         columns.append("sequence_5p_to_3p_cds")
 
-    # 9. Select and order final columns
+    # 8. Select and order final columns
     out = igr[columns].copy()
     out.rename(columns={"igr_id": "promoter_id"}, inplace=True)
 
     out.to_csv(cfg.final_table, sep="\t", index=False)
     print(f"  Final table ({len(out)} rows) -> {cfg.final_table}")
-    print("  Step 13 complete.\n")
+    print("  Step 12 complete.\n")
 
 
 STEPS = [
@@ -1768,24 +1877,14 @@ STEPS = [
     (7,  "Match IGRs to marker operons",     step07_match_igrs_to_markers),
     (8,  "Extract marker promoters",         step08_extract_marker_promoters),
     (9,  "Extract all promoters",            step09_extract_all_promoters),
-    (10, "Predict promoters (CNN classifier)", step10_predict_promoters),
+    (10, "Scan promoter motifs (-10/-35)",   step10_scan_motifs),
     (11, "Annotate CDS (Prokka)",            step11_annotate_cds),
-    (12, "Scan motifs (FIMO)",               step12_run_fimo),
-    (13, "Build final output table",         step13_final_table),
-    (14, "Generate HTML report",             step14_generate_report),
+    (12, "Build final output table",         step13_final_table),
+    (13, "Generate HTML report",             step14_generate_report),
 ]
 
 
 def main():
-    # Suppress TensorFlow C++ runtime warnings (CUDA probing, oneDNN,
-    # cudart_stub, TensorRT, etc.) BEFORE any TF import can happen.
-    # Level 3 = FATAL only; these must be set before the C++ runtime
-    # initialises, which happens at the first ``import tensorflow``.
-    import os
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-
     parser = argparse.ArgumentParser(
         description="ProFinder — bacterial and archaeal promoter identification pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1805,9 +1904,7 @@ def main():
                              "each sample gets a subdirectory.")
     parser.add_argument("--domain", choices=["bacteria", "archaea"],
                         default="bacteria",
-                        help="Target domain: 'bacteria' uses PromoterLCNN "
-                             "(σ-factor classification); 'archaea' uses "
-                             "iProm-Archaea (binary promoter/non-promoter). "
+                        help="Target domain (affects Prokka --kingdom). "
                              "Default: bacteria")
     parser.add_argument("--start", type=int, default=1,
                         help="First step to run (default: 1)")
@@ -1827,32 +1924,25 @@ def main():
                         help="Directory containing individual .hmm profile files "
                              "(default: bundled profiles)")
 
-    # PromoterLCNN (bacteria)
-    parser.add_argument("--lcnn-weights", type=Path, default=None,
-                        help="Directory containing PromoterLCNN SavedModel "
-                             "subdirectories (default: bundled weights/)")
-
-    # iProm-Archaea (archaea)
-    parser.add_argument("--ipromarchaea-weights", type=Path, default=None,
-                        help="Path to iProm-Archaea .h5 weights file "
-                             "(default: bundled weights/iPromArchaea/)")
-
-    # FIMO / motifs
-    parser.add_argument("--fimo", default="fimo",
-                        help="Path to fimo binary (default: fimo)")
+    # Motif scanning
     parser.add_argument("--motifs-dir", type=Path, default=None,
                         help="Directory containing .meme motif files "
                              "(default: bundled motifs/)")
-    parser.add_argument("--fimo-threshold", type=float, default=1e-4,
-                        help="FIMO p-value threshold (default: 1e-4)")
+    parser.add_argument("--p10", type=float, default=2.5e-3,
+                        help="p-value threshold for -10 motif hits "
+                             "(default: 0.0025)")
+    parser.add_argument("--p35", type=float, default=2.5e-3,
+                        help="p-value threshold for -35 motif hits "
+                             "(default: 0.0025)")
+    parser.add_argument("--p35-relaxed", type=float, default=0.05,
+                        help="Relaxed -35 p-value threshold when extended "
+                             "-10 TG is present (default: 0.05)")
 
     # Conda environments
     parser.add_argument("--conda-prokka", default="",
                         help="Conda env for Prokka (blank = use current env)")
     parser.add_argument("--conda-hmm", default="",
                         help="Conda env for hmmsearch (blank = use current env)")
-    parser.add_argument("--conda-meme", default="",
-                        help="Conda env for MEME Suite (blank = use current env)")
 
     # Parameters
     parser.add_argument("--threads", type=int, default=4,
@@ -1916,13 +2006,9 @@ def _build_config(args, kingdom, *, input_fasta, output_dir, prokka_prefix=None)
         domain=args.domain,
         prokka_bin=args.prokka,
         hmmsearch_bin=args.hmmsearch,
-        fimo_bin=args.fimo,
         hmm_profiles_dir=args.hmm_dir,
-        lcnn_weights_dir=args.lcnn_weights,
-        ipromarchaea_weights=args.ipromarchaea_weights,
         conda_env_prokka=args.conda_prokka,
         conda_env_hmm=args.conda_hmm,
-        conda_env_meme=args.conda_meme,
         threads=args.threads,
         prokka_kingdom=kingdom,
         prokka_prefix=prokka_prefix or args.prefix,
@@ -1932,7 +2018,9 @@ def _build_config(args, kingdom, *, input_fasta, output_dir, prokka_prefix=None)
         min_flanking_distance=args.min_flanking_dist,
         hmm_bitscore_min=args.hmm_bitscore,
         motifs_dir=args.motifs_dir,
-        fimo_threshold=args.fimo_threshold,
+        motif_p10=args.p10,
+        motif_p35=args.p35,
+        motif_p35_relaxed=args.p35_relaxed,
         cds_bp=args.cds_bp,
     )
 
