@@ -546,6 +546,14 @@ def step02_extract_igrs(cfg: Config, force: bool = False):
             print("    If you supplied an FNA file in the batch table, make "
                   "sure it contains contig sequences (not per-CDS nucleotides).")
 
+    # Add 5'→3' oriented sequence: reverse-complement CO_R, keep others as-is
+    if not igr_df.empty:
+        igr_df["sequence_5p_to_3p"] = igr_df.apply(
+            lambda r: _reverse_complement(r["sequence"]) if r["orientation"] == "CO_R"
+            else r["sequence"],
+            axis=1,
+        )
+
     igr_df.to_csv(cfg.igr_summary, sep="\t", index=False)
     print(f"  IGR summary ({len(igr_df)} regions) -> {cfg.igr_summary}")
 
