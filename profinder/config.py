@@ -28,16 +28,6 @@ class Config:
     # ── HMM profiles directory (bundled by default) ────────────────
     hmm_profiles_dir: Path = None
 
-    def __post_init__(self):
-        """Resolve bundled HMM path if none was provided."""
-        if self.hmm_profiles_dir is None:
-            candidate = Path(__file__).parent / "hmms"
-            self.hmm_profiles_dir = candidate if candidate.is_dir() else None
-
-        # Normalise domain to lowercase
-        self.domain = self.domain.lower()
-
-
     # ── Parallelism ──────────────────────────────────────────────────
     threads: int = 4
     num_workers: int = 4
@@ -58,7 +48,9 @@ class Config:
     hmm_bitscore_min: float = 25.0
 
     # ── CDS extension ────────────────────────────────────────────────
-    cds_bp: int = 0                   # number of CDS-start nt to append (0 = disabled)
+    cds_bp: int = 0                   # nt of downstream CDS appended to the
+                                      # sequence_5p_to_3p_cds column of
+                                      # profinder_results.tsv (0 = disabled)
 
     # ── Motif scanning parameters ────────────────────────────────────
     motifs_dir: Path = None           # directory containing .meme files
@@ -66,11 +58,39 @@ class Config:
     motif_p35: float = 2.5e-3        # p-value threshold for -35 hits (strict)
     motif_p35_relaxed: float = 0.05  # relaxed -35 threshold when ext -10 present
 
-    # ── Derived paths ────────────────────────────────────────────────
+    def __post_init__(self):
+        """Resolve bundled HMM path if none was provided."""
+        if self.hmm_profiles_dir is None:
+            candidate = Path(__file__).parent / "hmms"
+            self.hmm_profiles_dir = candidate if candidate.is_dir() else None
+
+        # Normalise domain to lowercase
+        self.domain = self.domain.lower()
+
+    # ── Subdirectories ───────────────────────────────────────────────
+    # Intermediates go into sub-process directories. Only the final
+    # deliverables live at the top level of output_dir.
     @property
     def prokka_dir(self) -> Path:
         return self.output_dir / "prokka"
 
+    @property
+    def igr_dir(self) -> Path:
+        return self.output_dir / "igr"
+
+    @property
+    def hmm_dir(self) -> Path:
+        return self.output_dir / "hmm"
+
+    @property
+    def operon_dir(self) -> Path:
+        return self.output_dir / "operons"
+
+    @property
+    def motif_dir(self) -> Path:
+        return self.output_dir / "motifs"
+
+    # ── Prokka outputs ───────────────────────────────────────────────
     @property
     def gff_file(self) -> Path:
         return self.prokka_dir / f"{self.prokka_prefix}.gff"
@@ -83,10 +103,7 @@ class Config:
     def fna_file(self) -> Path:
         return self.prokka_dir / f"{self.prokka_prefix}.fna"
 
-    @property
-    def igr_dir(self) -> Path:
-        return self.output_dir / "igr"
-
+    # ── IGR outputs ──────────────────────────────────────────────────
     @property
     def igr_fasta(self) -> Path:
         return self.igr_dir / "intergenic_regions.fasta"
@@ -95,14 +112,7 @@ class Config:
     def igr_summary(self) -> Path:
         return self.igr_dir / "igr_summary.tsv"
 
-    @property
-    def operon_file(self) -> Path:
-        return self.output_dir / "operons.tsv"
-
-    @property
-    def hmm_dir(self) -> Path:
-        return self.output_dir / "hmm"
-
+    # ── HMM outputs ──────────────────────────────────────────────────
     @property
     def hmm_combined(self) -> Path:
         return self.hmm_dir / "hmm_combined.tsv"
@@ -111,100 +121,82 @@ class Config:
     def hmm_filtered(self) -> Path:
         return self.hmm_dir / "hmm_filtered.tsv"
 
+    # ── Operon outputs (subdirectory) ────────────────────────────────
+    @property
+    def operon_file(self) -> Path:
+        return self.operon_dir / "operons.tsv"
+
     @property
     def operon_filtered(self) -> Path:
-        return self.output_dir / "operons_filtered.tsv"
+        return self.operon_dir / "operons_filtered.tsv"
 
     @property
     def operon_filtered_markers(self) -> Path:
-        return self.output_dir / "operons_filtered_markers.tsv"
+        return self.operon_dir / "operons_filtered_markers.tsv"
 
     @property
     def promoter_markers(self) -> Path:
-        return self.output_dir / "promoter_markers.tsv"
+        return self.operon_dir / "promoter_markers.tsv"
 
     @property
     def promoter_markers_hmm(self) -> Path:
-        return self.output_dir / "promoter_markers_hmm.tsv"
+        return self.operon_dir / "promoter_markers_hmm.tsv"
+
+    # ── Motif scan outputs (subdirectory) ────────────────────────────
+    @property
+    def motif_hits_all(self) -> Path:
+        return self.motif_dir / "motif_hits_all.tsv"
 
     @property
-    def promoter_fasta(self) -> Path:
-        return self.output_dir / "promoters.fasta"
+    def motif_best_all(self) -> Path:
+        return self.motif_dir / "motif_best_all.tsv"
 
     @property
-    def promoter_fasta_short(self) -> Path:
-        return self.output_dir / "promoters_short.fasta"
+    def motif_hits_markers(self) -> Path:
+        return self.motif_dir / "motif_hits_markers.tsv"
 
     @property
-    def all_promoter_fasta(self) -> Path:
-        return self.output_dir / "all_promoters.fasta"
+    def motif_best_markers(self) -> Path:
+        return self.motif_dir / "motif_best_markers.tsv"
 
     @property
-    def all_promoter_fasta_short(self) -> Path:
-        return self.output_dir / "all_promoters_short.fasta"
+    def promoter_markers_verified(self) -> Path:
+        return self.motif_dir / "promoter_markers_verified.tsv"
 
-    # ── CDS-extended FASTA outputs ──────────────────────────────────
+    # ── Final top-level deliverables ─────────────────────────────────
+    # Only these five files remain at the root of output_dir.
     @property
-    def promoter_cds_fasta(self) -> Path:
-        return self.output_dir / "promoters_cds_bp.fasta"
-
-    @property
-    def promoter_cds_fasta_short(self) -> Path:
-        return self.output_dir / "promoters_short_cds_bp.fasta"
-
-    @property
-    def all_promoter_cds_fasta(self) -> Path:
-        return self.output_dir / "all_promoters_cds_bp.fasta"
+    def all_promoters_verified_fasta(self) -> Path:
+        """FASTA of all CO_F/CO_R IGRs that passed the MEME motif
+        thresholds. CO_R sequences are reverse-complemented so every
+        record is oriented 5'→3'."""
+        return self.output_dir / "all_promoters_verified.fasta"
 
     @property
-    def all_promoter_cds_fasta_short(self) -> Path:
-        return self.output_dir / "all_promoters_short_cds_bp.fasta"
+    def marker_promoters_verified_fasta(self) -> Path:
+        """FASTA of CO_F/CO_R IGRs that are associated with a marker
+        gene (HMM) AND passed the MEME motif thresholds. CO_R sequences
+        are reverse-complemented so every record is oriented 5'→3'."""
+        return self.output_dir / "marker_promoters_verified.fasta"
+
+    @property
+    def cds_annotations(self) -> Path:
+        return self.output_dir / "cds_annotations.tsv"
+
+    @property
+    def final_table(self) -> Path:
+        return self.output_dir / "profinder_results.tsv"
+
+    @property
+    def report_html(self) -> Path:
+        return self.output_dir / "promoter_report.html"
 
     @property
     def is_archaea(self) -> bool:
         return self.domain == "archaea"
 
-    # ── Motif scan output ────────────────────────────────────────────
-    @property
-    def motif_hits_all(self) -> Path:
-        return self.output_dir / "motif_hits_all.tsv"
-
-    @property
-    def motif_best_all(self) -> Path:
-        return self.output_dir / "motif_best_all.tsv"
-
-    @property
-    def motif_hits_markers(self) -> Path:
-        return self.output_dir / "motif_hits_markers.tsv"
-
-    @property
-    def motif_best_markers(self) -> Path:
-        return self.output_dir / "motif_best_markers.tsv"
-
-    @property
-    def promoter_markers_verified(self) -> Path:
-        return self.output_dir / "promoter_markers_verified.tsv"
-
-    @property
-    def all_promoters_verified_fasta(self) -> Path:
-        return self.output_dir / "all_promoters_verified.fasta"
-
-    @property
-    def marker_promoters_verified_fasta(self) -> Path:
-        return self.output_dir / "marker_promoters_verified.fasta"
-
-    # ── Final output table ─────────────────────────────────────────────
-    @property
-    def final_table(self) -> Path:
-        return self.output_dir / "profinder_results.tsv"
-
-    # ── Report ────────────────────────────────────────────────────────
-    @property
-    def report_html(self) -> Path:
-        return self.output_dir / "promoter_report.html"
-
     def ensure_dirs(self):
         """Create all output directories."""
         for d in [self.output_dir, self.prokka_dir, self.igr_dir,
-                  self.hmm_dir]:
+                  self.hmm_dir, self.operon_dir, self.motif_dir]:
             d.mkdir(parents=True, exist_ok=True)
