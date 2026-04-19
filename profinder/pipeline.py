@@ -58,10 +58,22 @@ from itertools import product as iprod
 from pathlib import Path
 
 import pandas as pd
+from Bio import SeqIO
 from Bio.Seq import Seq
 
 from .config import Config
 from .igr_extractor import extract_igrs
+
+
+# Shared reverse-complement translation table.  Used by the motif-scan
+# inner loop which builds two strands per sequence — recreating the
+# translation table per row is measurable on large IGR sets.
+_REVCOMP_TRANS = str.maketrans("ACGTacgt", "TGCAtgca")
+
+
+def _revcomp_simple(s: str) -> str:
+    """Fast reverse-complement using the module-level translation table."""
+    return s.translate(_REVCOMP_TRANS)[::-1]
 
 
 # =====================================================================
@@ -312,11 +324,7 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
         raw = raw.upper()
         igr_id = row[id_col]
 
-        def _revcomp(s):
-            comp = str.maketrans("ACGTacgt", "TGCAtgca")
-            return s.translate(comp)[::-1]
-
-        for strand, seq in [("+", raw), ("-", _revcomp(raw))]:
+        for strand, seq in [("+", raw), ("-", _revcomp_simple(raw))]:
             for r in _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
                 out = {id_col: igr_id, "strand": strand}
                 for k in _MOTIF_COLUMNS:
@@ -523,7 +531,6 @@ def step02_extract_igrs(cfg: Config, force: bool = False):
                     continue
                 gff_contigs.add(line.split("\t", 1)[0])
         # Check if any GFF contig appears in the FNA headers
-        from Bio import SeqIO
         fna_ids = {rec.id for rec in SeqIO.parse(str(cfg.fna_file), "fasta")}
         if gff_contigs & fna_ids:
             fasta_source = cfg.fna_file
@@ -915,7 +922,6 @@ def _write_fasta(df, output_path, short_header=False):
 
 def _load_contigs(fasta_path):
     """Load contig sequences from a genome FASTA into a dict."""
-    from Bio import SeqIO
     return {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
 
 
@@ -968,119 +974,8 @@ def _add_cds_column(df, contigs, n_bp):
     return df
 
 
-def _write_fasta_cds(df, output_path, short_header=False):
-    """Write promoter+CDS FASTA from a DataFrame that has
-    ``sequence_5p_to_3p_cds``.
-    """
-    with open(output_path, "w") as fh:
-        for _, row in df.iterrows():
-            seq = row["sequence_5p_to_3p_cds"]
-            igr_id = row["igr_id"]
-            orient = row["orientation"]
-            if short_header:
-                header = f">{igr_id}_{orient}"
-            else:
-                header = (f">{igr_id}_{row['contig']}_{orient}"
-                          f"_{row['left_gene']}_{row['right_gene']}")
-            fh.write(f"{header}\n{seq}\n")
-    print(f"  FASTA+CDS ({len(df)} seqs, short={short_header}) -> {output_path}")
-
-
-def step08_extract_marker_promoters(cfg: Config, force: bool = False):
-    """Extract marker-filtered promoter sequences in 5'→3' orientation."""
-    if not force and cfg.promoter_fasta_short.exists():
-        print("── Marker promoter FASTA already exists, skipping ──")
-        print("  Step 8 complete.\n")
-        return
-
-    print("── Extracting marker-filtered promoter sequences ──")
-    try:
-        df = pd.read_csv(cfg.promoter_markers, sep="\t")
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        print("  No promoter markers to extract.")
-        print("  Step 8 complete.\n")
-        return
-
-    if df.empty:
-        print("  No promoter markers to extract.")
-        print("  Step 8 complete.\n")
-        return
-
-    # Remove divergent promoters (ambiguous orientation)
-    df = df[df["orientation"] != "DP"].copy()
-
-    # Drop rows with missing sequences
-    df = df[df["sequence"].notna() & (df["sequence"] != "")].copy()
-
-    # Orient 5'→3': CO_R sequences need reverse complement
-    df["sequence_5p_to_3p"] = df.apply(
-        lambda r: _reverse_complement(r["sequence"]) if r["orientation"] == "CO_R"
-        else r["sequence"],
-        axis=1,
-    )
-
-    _write_fasta(df, cfg.promoter_fasta, short_header=False)
-    _write_fasta(df, cfg.promoter_fasta_short, short_header=True)
-
-    if cfg.cds_bp > 0:
-        contigs = _load_contigs(cfg.input_fasta)
-        df = _add_cds_column(df, contigs, cfg.cds_bp)
-        _write_fasta_cds(df, cfg.promoter_cds_fasta, short_header=False)
-        _write_fasta_cds(df, cfg.promoter_cds_fasta_short, short_header=True)
-
-    print("  Step 8 complete.\n")
-
-
-def step09_extract_all_promoters(cfg: Config, force: bool = False):
-    """Extract ALL promoter-orientation IGRs (no HMM filter)."""
-    if not force and cfg.all_promoter_fasta_short.exists():
-        print("── All-promoter FASTA already exists, skipping ──")
-        print("  Step 9 complete.\n")
-        return
-
-    print("── Extracting all promoter-orientation IGRs ──")
-    igr = pd.read_csv(cfg.igr_summary, sep="\t")
-
-    # Keep only promoter-relevant orientations (exclude convergent/terminator)
-    promoter_orientations = igr[igr["orientation"].isin(["CO_F", "CO_R", "DP"])].copy()
-    n_dropped = len(igr) - len(promoter_orientations)
-    if n_dropped:
-        print(f"  Dropped {n_dropped} convergent (terminator) IGRs")
-
-    # Remove divergent promoters (can't unambiguously orient)
-    df = promoter_orientations[promoter_orientations["orientation"] != "DP"].copy()
-    n_dp = len(promoter_orientations) - len(df)
-    if n_dp:
-        print(f"  Excluded {n_dp} divergent promoters (ambiguous orientation)")
-
-    # Drop rows with missing sequences (can happen with degenerate IGRs)
-    n_before = len(df)
-    df = df[df["sequence"].notna() & (df["sequence"] != "")].copy()
-    n_dropped_na = n_before - len(df)
-    if n_dropped_na:
-        print(f"  Dropped {n_dropped_na} IGRs with missing sequences")
-
-    # Orient 5'→3'
-    df["sequence_5p_to_3p"] = df.apply(
-        lambda r: _reverse_complement(r["sequence"]) if r["orientation"] == "CO_R"
-        else r["sequence"],
-        axis=1,
-    )
-
-    _write_fasta(df, cfg.all_promoter_fasta, short_header=False)
-    _write_fasta(df, cfg.all_promoter_fasta_short, short_header=True)
-
-    if cfg.cds_bp > 0:
-        contigs = _load_contigs(cfg.input_fasta)
-        df = _add_cds_column(df, contigs, cfg.cds_bp)
-        _write_fasta_cds(df, cfg.all_promoter_cds_fasta, short_header=False)
-        _write_fasta_cds(df, cfg.all_promoter_cds_fasta_short, short_header=True)
-
-    print("  Step 9 complete.\n")
-
-
 # =====================================================================
-#  Step 10 — Motif-based promoter filtering
+#  Step 8 — Motif-based promoter filtering
 #
 #  Scans promoter sequences for -10 and -35 hexamer motifs using PWMs
 #  from bundled .meme files (collectf, prodoric, regtransbase).
@@ -1089,21 +984,25 @@ def step09_extract_all_promoters(cfg: Config, force: bool = False):
 #    Path B: -10 hit + extended -10 TG dinucleotide + relaxed/absent -35
 # =====================================================================
 
-def step10_scan_motifs(cfg: Config, force: bool = False):
+def step08_scan_motifs(cfg: Config, force: bool = False):
     """Scan promoter sequences for -10/-35 motifs and filter.
 
-    Writes:
+    Writes into ``motifs/``:
     * ``motif_hits_all.tsv``       — all hits for all promoter-orientation IGRs
     * ``motif_best_all.tsv``       — best hit per IGR (all promoters)
     * ``motif_hits_markers.tsv``   — all hits for marker promoters only
     * ``motif_best_markers.tsv``   — best hit per IGR (markers only)
     * ``promoter_markers_verified.tsv`` — marker promoters confirmed by motif scan
-    * ``all_promoters_verified.fasta``  — FASTA of all motif-confirmed promoters
-    * ``marker_promoters_verified.fasta`` — FASTA of marker motif-confirmed promoters
+
+    Writes at the top level of ``output_dir``:
+    * ``all_promoters_verified.fasta``    — all motif-confirmed promoters,
+      CO_R sequences reverse-complemented so every record is 5'→3'
+    * ``marker_promoters_verified.fasta`` — marker + motif-confirmed promoters,
+      CO_R sequences reverse-complemented so every record is 5'→3'
     """
     if not force and cfg.motif_best_all.exists() and cfg.promoter_markers_verified.exists():
         print("── Motif scan results already exist, skipping ──")
-        print("  Step 10 complete.\n")
+        print("  Step 8 complete.\n")
         return
 
     # Locate motifs directory
@@ -1115,7 +1014,7 @@ def step10_scan_motifs(cfg: Config, force: bool = False):
         else:
             print("── No motifs directory found, skipping motif scan ──")
             pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
-            print("  Step 10 complete.\n")
+            print("  Step 8 complete.\n")
             return
 
     # Load motif sets with configured p-value thresholds
@@ -1128,7 +1027,7 @@ def step10_scan_motifs(cfg: Config, force: bool = False):
     if not m10.entries:
         print("  No Minus10 motifs loaded — cannot scan.")
         pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
-        print("  Step 10 complete.\n")
+        print("  Step 8 complete.\n")
         return
 
     # Report thresholds
@@ -1153,7 +1052,7 @@ def step10_scan_motifs(cfg: Config, force: bool = False):
                   cfg.motif_hits_markers, cfg.motif_best_markers]:
             pd.DataFrame().to_csv(p, sep="\t", index=False)
         pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
-        print("  Step 10 complete.\n")
+        print("  Step 8 complete.\n")
         return
 
     # Orient sequences 5'→3'
@@ -1194,7 +1093,7 @@ def step10_scan_motifs(cfg: Config, force: bool = False):
         for p in [cfg.motif_hits_markers, cfg.motif_best_markers]:
             pd.DataFrame().to_csv(p, sep="\t", index=False)
         pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
-        print("  Step 10 complete.\n")
+        print("  Step 8 complete.\n")
         return
 
     # Orient marker sequences 5'→3'
@@ -1235,11 +1134,11 @@ def step10_scan_motifs(cfg: Config, force: bool = False):
     # Write verified marker promoter FASTA
     _write_fasta(verified_df, cfg.marker_promoters_verified_fasta, short_header=False)
 
-    print("  Step 10 complete.\n")
+    print("  Step 8 complete.\n")
 
 
 # =====================================================================
-#  Step 11 — Annotate associated CDS from Prokka
+#  Step 9 — Annotate associated CDS from Prokka
 # =====================================================================
 
 def _parse_prokka_gff_annotations(gff_path, gene_ids=None):
@@ -1292,13 +1191,13 @@ def _parse_prokka_gff_annotations(gff_path, gene_ids=None):
     return annotations
 
 
-def step11_annotate_cds(cfg: Config, force: bool = False):
+def step09_annotate_cds(cfg: Config, force: bool = False):
     """Extract CDS annotations (product, gene name, locus tag) from Prokka
     GFF for ALL promoter-orientation IGRs."""
-    annotation_tsv = cfg.output_dir / "cds_annotations.tsv"
+    annotation_tsv = cfg.cds_annotations
     if not force and annotation_tsv.exists():
         print("── CDS annotations already exist, skipping ──")
-        print("  Step 11 complete.\n")
+        print("  Step 9 complete.\n")
         return
 
     # Collect CDS gene IDs from ALL promoter-orientation IGRs.
@@ -1317,7 +1216,7 @@ def step11_annotate_cds(cfg: Config, force: bool = False):
         print("── No promoter-associated CDS to annotate ──")
         pd.DataFrame(columns=["gene_id", "product", "gene", "locus_tag"]).to_csv(
             annotation_tsv, sep="\t", index=False)
-        print("  Step 11 complete.\n")
+        print("  Step 9 complete.\n")
         return
 
     print(f"── Annotating {len(gene_ids)} CDS from Prokka GFF ──")
@@ -1335,11 +1234,11 @@ def step11_annotate_cds(cfg: Config, force: bool = False):
     result_df = pd.DataFrame(rows)
     result_df.to_csv(annotation_tsv, sep="\t", index=False)
     print(f"  Annotated {len(result_df)} CDS -> {annotation_tsv}")
-    print("  Step 11 complete.\n")
+    print("  Step 9 complete.\n")
 
 
 # =====================================================================
-#  Step 14 — HTML report
+#  Step 11 — HTML report
 # =====================================================================
 
 def _get_associated_gene(row):
@@ -1408,32 +1307,42 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50):
     return "\n".join(parts)
 
 
-def step14_generate_report(cfg: Config, force: bool = False):
+def step11_generate_report(cfg: Config, force: bool = False):
     """Generate an HTML report combining promoters, CDS annotations,
     and motif hit positions with visual sequence diagrams."""
     if not force and cfg.report_html.exists():
         print("── HTML report already exists, skipping ──")
-        print("  Step 13 complete.\n")
+        print("  Step 11 complete.\n")
         return
 
     print("── Generating HTML report ──")
 
-    # Load verified promoters (after motif scan).
-    # Falls back to promoter_markers if verified file doesn't exist.
-    source_file = cfg.promoter_markers_verified if cfg.promoter_markers_verified.exists() else cfg.promoter_markers
+    # Load verified promoters (after motif scan).  Step 8 may have
+    # written an empty placeholder file on a bailout path, so fall back
+    # to promoter_markers.tsv if the verified file is empty or lacks the
+    # expected columns.
+    candidates = []
+    if cfg.promoter_markers_verified.exists():
+        candidates.append(cfg.promoter_markers_verified)
+    if cfg.promoter_markers.exists():
+        candidates.append(cfg.promoter_markers)
+
     promoter_df = None
-    if source_file.exists():
+    for source_file in candidates:
         try:
             df = pd.read_csv(source_file, sep="\t")
-            df = df[df["orientation"].isin(["CO_F", "CO_R"])].copy()
-            if not df.empty:
-                promoter_df = df
         except pd.errors.EmptyDataError:
-            pass
+            continue
+        if "orientation" not in df.columns:
+            continue
+        df = df[df["orientation"].isin(["CO_F", "CO_R"])].copy()
+        if not df.empty:
+            promoter_df = df
+            break
 
     if promoter_df is None or promoter_df.empty:
         print("  No verified promoter data available for report.")
-        print("  Step 13 complete.\n")
+        print("  Step 11 complete.\n")
         return
 
     # Count all promoter-orientation IGRs for reference
@@ -1457,7 +1366,7 @@ def step14_generate_report(cfg: Config, force: bool = False):
 
     # Load CDS annotations (Prokka product names)
     annotation_map = {}
-    annotation_tsv = cfg.output_dir / "cds_annotations.tsv"
+    annotation_tsv = cfg.cds_annotations
     if annotation_tsv.exists():
         try:
             ann_df = pd.read_csv(annotation_tsv, sep="\t")
@@ -1467,7 +1376,7 @@ def step14_generate_report(cfg: Config, force: bool = False):
             pass
 
     # Build motif hit info from verified markers (motif_pos_10, motif_pos_35, etc.)
-    # These columns were added by step 10 when writing promoter_markers_verified.tsv
+    # These columns were added by step 8 when writing promoter_markers_verified.tsv
     has_motif_cols = "motif_pos_10" in promoter_df.columns
 
     # Build HTML
@@ -1481,10 +1390,12 @@ def step14_generate_report(cfg: Config, force: bool = False):
 
     genome_name = cfg.input_fasta.stem
 
-    # Paths for file links (relative to output dir)
-    all_promo_name = cfg.all_promoter_fasta.name if cfg.all_promoter_fasta.exists() else ""
-    verified_tsv_name = cfg.promoter_markers_verified.name if cfg.promoter_markers_verified.exists() else ""
-    promoters_fasta_name = cfg.promoter_fasta.name if cfg.promoter_fasta.exists() else ""
+    # Paths for file links (relative to output_dir).
+    all_verified_name = (cfg.all_promoters_verified_fasta.name
+                         if cfg.all_promoters_verified_fasta.exists() else "")
+    marker_verified_name = (cfg.marker_promoters_verified_fasta.name
+                            if cfg.marker_promoters_verified_fasta.exists() else "")
+    cds_ann_name = cfg.cds_annotations.name if cfg.cds_annotations.exists() else ""
     final_table_name = cfg.final_table.name if cfg.final_table.exists() else ""
 
     domain_label = "Archaea" if cfg.is_archaea else "Bacteria"
@@ -1495,9 +1406,9 @@ def step14_generate_report(cfg: Config, force: bool = False):
         n_all_promoters=n_all_promoters,
         n_annotated=n_annotated,
         n_with_motifs=n_with_motifs,
-        all_promoters_fasta=html_mod.escape(all_promo_name),
-        verified_tsv=html_mod.escape(verified_tsv_name),
-        promoters_fasta=html_mod.escape(promoters_fasta_name),
+        all_verified_fasta=html_mod.escape(all_verified_name),
+        marker_verified_fasta=html_mod.escape(marker_verified_name),
+        cds_annotations_tsv=html_mod.escape(cds_ann_name),
         final_table=html_mod.escape(final_table_name),
         domain_label=domain_label,
     )]
@@ -1554,8 +1465,15 @@ def step14_generate_report(cfg: Config, force: bool = False):
                         "stop": p10 + _MOTIF_WIDTH,
                         "motif_database": "minus10",
                     })
-                    # Extended -10 TG
-                    if str(row.get("motif_has_ext10", "")).lower() == "true":
+                    # Extended -10 TG.  The column may be a Python bool
+                    # (unread DataFrame), the string "True"/"False" (TSV
+                    # round-trip), or missing altogether.
+                    ext10_raw = row.get("motif_has_ext10", False)
+                    if isinstance(ext10_raw, bool):
+                        has_ext10_flag = ext10_raw
+                    else:
+                        has_ext10_flag = str(ext10_raw).strip().lower() == "true"
+                    if has_ext10_flag:
                         motif_hits.append({
                             "motif_id": "ext-10 (TG)",
                             "start": p10 - 1,  # TG is 2 nt before -10
@@ -1629,7 +1547,7 @@ def step14_generate_report(cfg: Config, force: bool = False):
     with open(cfg.report_html, "w") as fh:
         fh.write("\n".join(html_parts))
     print(f"  Report -> {cfg.report_html}")
-    print("  Step 13 complete.\n")
+    print("  Step 11 complete.\n")
 
 
 # ── HTML template fragments ──────────────────────────────────────────
@@ -1714,9 +1632,9 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 </p>
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
     <strong>Downloads:</strong>
-    <a href="{promoters_fasta}">promoters.fasta</a> &middot;
-    <a href="{verified_tsv}">promoter_markers_verified.tsv</a> &middot;
-    <a href="{all_promoters_fasta}">all_promoters.fasta</a> &middot;
+    <a href="{marker_verified_fasta}">marker_promoters_verified.fasta</a> &middot;
+    <a href="{all_verified_fasta}">all_promoters_verified.fasta</a> &middot;
+    <a href="{cds_annotations_tsv}">cds_annotations.tsv</a> &middot;
     <a href="{final_table}">profinder_results.tsv</a>
 </p>
 
@@ -1732,10 +1650,10 @@ _REPORT_HTML_FOOT = """
 """
 
 # =====================================================================
-#  Step 13 — Final output table
+#  Step 10 — Final output table
 # =====================================================================
 
-def step13_final_table(cfg: Config, force: bool = False):
+def step10_final_table(cfg: Config, force: bool = False):
     """Build a comprehensive TSV table covering ALL promoter-orientation
     IGRs with every piece of metadata collected by the pipeline.
 
@@ -1770,7 +1688,7 @@ def step13_final_table(cfg: Config, force: bool = False):
     """
     if not force and cfg.final_table.exists():
         print("── Final output table already exists, skipping ──")
-        print("  Step 12 complete.\n")
+        print("  Step 10 complete.\n")
         return
 
     print("── Building final output table ──")
@@ -1785,7 +1703,7 @@ def step13_final_table(cfg: Config, force: bool = False):
     if igr.empty:
         print("  No promoter-orientation IGRs found.")
         pd.DataFrame().to_csv(cfg.final_table, sep="\t", index=False)
-        print("  Step 12 complete.\n")
+        print("  Step 10 complete.\n")
         return
 
     # 2. Associated CDS
@@ -1799,7 +1717,7 @@ def step13_final_table(cfg: Config, force: bool = False):
     )
 
     # 4. CDS annotations (gene name, locus tag, product)
-    annotation_tsv = cfg.output_dir / "cds_annotations.tsv"
+    annotation_tsv = cfg.cds_annotations
     ann_map = {}   # gene_id -> {product, gene, locus_tag}
     if annotation_tsv.exists():
         try:
@@ -1830,7 +1748,7 @@ def step13_final_table(cfg: Config, force: bool = False):
             pass
     igr["is_marker"] = igr["igr_id"].isin(marker_igr_ids)
 
-    # 6. Motif scan results (best hit per IGR from step 10)
+    # 6. Motif scan results (best hit per IGR from step 8)
     motif_cols = ["strand", "pos_10", "seq_10", "score_10", "source_10",
                   "has_ext10", "pos_35", "seq_35", "score_35", "source_35",
                   "spacer_len", "spacer_seq", "path"]
@@ -1872,23 +1790,21 @@ def step13_final_table(cfg: Config, force: bool = False):
 
     out.to_csv(cfg.final_table, sep="\t", index=False)
     print(f"  Final table ({len(out)} rows) -> {cfg.final_table}")
-    print("  Step 12 complete.\n")
+    print("  Step 10 complete.\n")
 
 
 STEPS = [
-    (1,  "Run Prokka",                      step01_run_prokka),
+    (1,  "Run Prokka",                       step01_run_prokka),
     (2,  "Extract intergenic regions",       step02_extract_igrs),
     (3,  "Identify operons",                 step03_identify_operons),
     (4,  "Run hmmsearch",                    step04_run_hmmsearch),
-    (5,  "Filter HMM output",               step05_filter_hmm),
+    (5,  "Filter HMM output",                step05_filter_hmm),
     (6,  "Filter operons + add markers",     step06_filter_operons_add_markers),
     (7,  "Match IGRs to marker operons",     step07_match_igrs_to_markers),
-    (8,  "Extract marker promoters",         step08_extract_marker_promoters),
-    (9,  "Extract all promoters",            step09_extract_all_promoters),
-    (10, "Scan promoter motifs (-10/-35)",   step10_scan_motifs),
-    (11, "Annotate CDS (Prokka)",            step11_annotate_cds),
-    (12, "Build final output table",         step13_final_table),
-    (13, "Generate HTML report",             step14_generate_report),
+    (8,  "Scan promoter motifs (-10/-35)",   step08_scan_motifs),
+    (9,  "Annotate CDS (Prokka)",            step09_annotate_cds),
+    (10, "Build final output table",         step10_final_table),
+    (11, "Generate HTML report",             step11_generate_report),
 ]
 
 
@@ -1897,9 +1813,11 @@ def main():
         description="ProFinder — bacterial and archaeal promoter identification pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    input_group = parser.add_mutually_exclusive_group(
-        required="--list" not in sys.argv,
-    )
+    # Single-sample and batch inputs are mutually exclusive.  Requirement
+    # is enforced manually after parse_args so --list can run without
+    # either (an argparse `required=` flag here would need to know about
+    # --list before the parser has run).
+    input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("-i", "--input", type=Path,
                              help="Input genome FASTA file (single-sample mode)")
     input_group.add_argument("--batch", type=Path,
@@ -1980,6 +1898,12 @@ def main():
         for num, name, _ in STEPS:
             print(f"  {num:2d}. {name}")
         sys.exit(0)
+
+    # One of --input / --batch is required for any real run. We enforce
+    # this here (rather than via argparse `required=`) so --list can run
+    # without either.
+    if args.input is None and args.batch is None:
+        parser.error("one of the arguments -i/--input --batch is required")
 
     # When running in archaea mode, default Prokka kingdom to Archaea
     # unless the user explicitly provided --kingdom.
