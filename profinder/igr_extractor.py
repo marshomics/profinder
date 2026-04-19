@@ -94,40 +94,55 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
 
     df = pd.DataFrame(genes).sort_values(["contig", "start"]).reset_index(drop=True)
 
-    # Walk consecutive gene pairs on each contig
+    # Walk consecutive gene pairs on each contig.  We track the farthest
+    # end seen so far (``max_end``) rather than the previous gene's end,
+    # so nested/contained genes don't produce a bogus IGR inside an
+    # enclosing gene's body.
     rows = []
     igr_counter = 0
     for contig_id, grp in df.groupby("contig", sort=False):
         grp = grp.sort_values("start").reset_index(drop=True)
         contig_seq = contigs.get(contig_id, "")
 
-        for i in range(len(grp) - 1):
-            left = grp.iloc[i]
-            right = grp.iloc[i + 1]
+        max_end = -1                         # 1-based; -1 means no gene seen yet
+        left_gene_for_gap = None             # the gene whose end == max_end
+        for i in range(len(grp)):
+            curr = grp.iloc[i]
 
-            igr_start = left["end"] + 1        # 1-based, inclusive
-            igr_end = right["start"] - 1
-            igr_len = igr_end - igr_start + 1
-
-            if igr_len < size_min or igr_len > size_max:
+            # If the current gene is entirely inside the span already
+            # covered by an earlier gene, skip it — no IGR to emit and
+            # we don't want to update max_end downward.
+            if curr["end"] <= max_end:
                 continue
 
-            orientation = _classify_orientation(left["strand"], right["strand"])
+            if left_gene_for_gap is not None:
+                igr_start = max_end + 1        # 1-based, inclusive
+                igr_end = curr["start"] - 1
+                igr_len = igr_end - igr_start + 1
 
-            # Extract sequence (GFF is 1-based; Python slicing is 0-based)
-            seq = contig_seq[igr_start - 1 : igr_end] if contig_seq else ""
+                if size_min <= igr_len <= size_max:
+                    left = left_gene_for_gap
+                    right = curr
+                    orientation = _classify_orientation(left["strand"], right["strand"])
 
-            igr_counter += 1
-            rows.append({
-                "igr_id": f"igr_{igr_counter:06d}",
-                "contig": contig_id,
-                "start": igr_start,
-                "end": igr_end,
-                "length": igr_len,
-                "orientation": orientation,
-                "left_gene": left["gene_id"],
-                "right_gene": right["gene_id"],
-                "sequence": seq,
-            })
+                    # Extract sequence (GFF is 1-based; Python slicing is 0-based)
+                    seq = contig_seq[igr_start - 1 : igr_end] if contig_seq else ""
+
+                    igr_counter += 1
+                    rows.append({
+                        "igr_id": f"igr_{igr_counter:06d}",
+                        "contig": contig_id,
+                        "start": igr_start,
+                        "end": igr_end,
+                        "length": igr_len,
+                        "orientation": orientation,
+                        "left_gene": left["gene_id"],
+                        "right_gene": right["gene_id"],
+                        "sequence": seq,
+                    })
+
+            # Advance the right-boundary tracker
+            max_end = curr["end"]
+            left_gene_for_gap = curr
 
     return pd.DataFrame(rows)
