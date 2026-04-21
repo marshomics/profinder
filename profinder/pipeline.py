@@ -1434,6 +1434,29 @@ def step11_generate_report(cfg: Config, force: bool = False):
     # These columns were added by step 8 when writing promoter_markers_verified.tsv
     has_motif_cols = "motif_pos_10" in promoter_df.columns
 
+    # Sort rows by motif path priority (A > B > C > other), then by
+    # -10 score descending, so the strongest evidence appears first.
+    if has_motif_cols:
+        def _path_rank(v):
+            return {"A": 0, "B": 1, "C": 2}.get(str(v).strip(), 3)
+
+        def _score_key(v):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return float("-inf")
+            return f
+
+        promoter_df = promoter_df.assign(
+            _path_rank=promoter_df["motif_path"].map(_path_rank),
+            _score_key=promoter_df.get(
+                "motif_score_10", pd.Series([None] * len(promoter_df))
+            ).map(_score_key),
+        )
+        promoter_df = promoter_df.sort_values(
+            by=["_path_rank", "_score_key"], ascending=[True, False]
+        ).drop(columns=["_path_rank", "_score_key"])
+
     # Build HTML
     n_promoters = len(promoter_df)
     n_annotated = sum(1 for _, r in promoter_df.iterrows()
@@ -1468,14 +1491,23 @@ def step11_generate_report(cfg: Config, force: bool = False):
         domain_label=domain_label,
     )]
 
-    # Legend for motif diagram
+    # Legend for motif diagram + path colour code
     html_parts.append("""
+    <div class="legend">
+        <strong>Motif path:</strong>
+        <span class="legend-item"><span class="path path-a">A</span> linked &minus;10/&minus;35 (same subgroup), 15&ndash;19 bp</span>
+        <span class="legend-item"><span class="path path-b">B</span> extended &minus;10 + relaxed &minus;35, 15&ndash;19 bp</span>
+        <span class="legend-item"><span class="path path-c">C</span> unlinked &minus;10/&minus;35 (different subgroups), 15&ndash;19 bp</span>
+    </div>
     <div class="legend">
         <strong>Motif diagram:</strong>
         <span class="legend-item"><span class="legend-swatch" style="background:#1565c0"></span>&minus;35 element</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#c62828"></span>&minus;10 element</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#ff8f00"></span>Extended &minus;10 (TG)</span>
     </div>
+    <p style="font-size:0.8rem; color:#777; margin-bottom:16px;">
+        Rows are sorted by path priority (A &rarr; B &rarr; C), then by &minus;10 score.
+    </p>
     """)
 
     # Table
@@ -1556,7 +1588,14 @@ def step11_generate_report(cfg: Config, force: bool = False):
         seq = row.get("sequence_5p_to_3p", "")
 
         # Motif details
-        motif_path = str(row.get("motif_path", "")) if has_motif_cols else ""
+        motif_path = str(row.get("motif_path", "")).strip() if has_motif_cols else ""
+        path_key = motif_path if motif_path in ("A", "B", "C") else ""
+        if path_key:
+            path_cell = f'<span class="path path-{path_key.lower()}">{path_key}</span>'
+            row_class = f"row-{path_key.lower()}"
+        else:
+            path_cell = '<span class="path path-none">&mdash;</span>'
+            row_class = ""
         seq_10 = str(row.get("motif_seq_10", "")) if has_motif_cols else ""
         score_10 = row.get("motif_score_10", "") if has_motif_cols else ""
         source_10 = str(row.get("motif_source_10", "")) if has_motif_cols else ""
@@ -1578,13 +1617,13 @@ def step11_generate_report(cfg: Config, force: bool = False):
         product_cell = html_mod.escape(product) if product else '<span class="na">—</span>'
 
         html_parts.append(f"""
-        <tr>
+        <tr class="{row_class}">
             <td><code>{html_mod.escape(igr_id)}</code></td>
             <td>{html_mod.escape(str(row['contig']))}</td>
             <td>{row['start']:,}–{row['end']:,}</td>
             <td>{row['length']}</td>
             <td><span class="orient {orient_class}">{row['orientation']}</span></td>
-            <td>{html_mod.escape(motif_path)}</td>
+            <td>{path_cell}</td>
             <td>{minus10_cell}</td>
             <td>{minus35_cell}</td>
             <td>{spacer_cell}</td>
@@ -1661,6 +1700,19 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
     }}
     .co-f {{ background: #e3f2fd; color: #1565c0; }}
     .co-r {{ background: #fce4ec; color: #c62828; }}
+    .path {{
+        display: inline-block; padding: 2px 10px; border-radius: 10px;
+        font-size: 0.78rem; font-weight: 700; letter-spacing: 0.3px;
+        min-width: 22px; text-align: center;
+    }}
+    .path-a {{ background: #e8f5e9; color: #2e7d32; }}
+    .path-b {{ background: #fff8e1; color: #e65100; }}
+    .path-c {{ background: #ffebee; color: #c62828; }}
+    .path-none {{ background: #f5f5f5; color: #999; }}
+    tr.row-a {{ background: #f4faf4; }}
+    tr.row-b {{ background: #fffcf2; }}
+    tr.row-c {{ background: #fdf4f4; }}
+    tr.row-a:hover, tr.row-b:hover, tr.row-c:hover {{ background: #eef4ef; }}
     .na {{ color: #bbb; }}
     small {{ color: #888; }}
     footer {{
