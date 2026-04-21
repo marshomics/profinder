@@ -34,4 +34,4 @@ Repository = "https://github.com/jmarsh/profinder"
 include = ["profinder*"]
 
 [tool.setuptools.package-data]
-profinder = ["motifs/*.meme", "hmms/*.hmm", "weights/**/*"]
+profinder = ["all_unique_subgroups.meme", "hmms/*.hmm", "weights/**/*"]
