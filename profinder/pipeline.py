@@ -1455,23 +1455,32 @@ def step11_generate_report(cfg: Config, force: bool = False):
     has_motif_cols = "motif_pos_10" in promoter_df.columns
 
     # Sort rows by motif path priority (A > B > C > D > other), then
-    # by -10 score descending, so the strongest evidence appears first.
+    # within each group by a combined -10+-35 log-odds score descending,
+    # so the strongest evidence appears first. Log-odds scores are
+    # additive (log-probability-ratio), so the sum is a single
+    # comparable measure of joint -10/-35 significance. Path D rows
+    # have no -35, so they are ranked within the D group by the -10
+    # score alone.
     if has_motif_cols:
         def _path_rank(v):
             return {"A": 0, "B": 1, "C": 2, "D": 3}.get(str(v).strip(), 4)
 
-        def _score_key(v):
+        def _as_float(v):
             try:
-                f = float(v)
+                return float(v)
             except (TypeError, ValueError):
+                return None
+
+        def _combined_score(row):
+            s10 = _as_float(row.get("motif_score_10"))
+            if s10 is None:
                 return float("-inf")
-            return f
+            s35 = _as_float(row.get("motif_score_35"))
+            return s10 + s35 if s35 is not None else s10
 
         promoter_df = promoter_df.assign(
             _path_rank=promoter_df["motif_path"].map(_path_rank),
-            _score_key=promoter_df.get(
-                "motif_score_10", pd.Series([None] * len(promoter_df))
-            ).map(_score_key),
+            _score_key=promoter_df.apply(_combined_score, axis=1),
         )
         promoter_df = promoter_df.sort_values(
             by=["_path_rank", "_score_key"], ascending=[True, False]
