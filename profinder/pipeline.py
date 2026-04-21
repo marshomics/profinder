@@ -8,7 +8,11 @@ and outputs promoter sequences in 5'-to-3' orientation.
 
 Use ``--domain bacteria`` (default) or ``--domain archaea``.
 Promoter verification is performed by scanning for -10/-35 hexamer
-motifs using position weight matrices from bundled MEME databases.
+motifs using position weight matrices from the bundled
+``all_unique_subgroups.meme`` file. Each -10 hit is classified as
+Path A (linked -10/-35 same subgroup, 15–19 bp spacer), Path B
+(extended -10 with variable or absent -35), or Path C (unlinked
+-10/-35, 15–19 bp spacer). Anything else is no hit.
 
 Usage
 -----
@@ -40,12 +44,10 @@ Steps
     5.  Filter HMM output
     6.  Filter operons and add marker info
     7.  Match IGRs to marker operons
-    8.  Extract promoter sequences (marker-filtered)
-    9.  Extract all promoter sequences (orientation-based, no HMM filter)
-    10. Scan promoter motifs (-10/-35 hexamer verification)
-    11. Annotate associated CDS (Prokka product names, gene, locus tag)
-    12. Build final output table (all promoters, all metadata)
-    13. Generate HTML report
+    8.  Scan promoter motifs (-10/-35 hexamer verification, A/B/C)
+    9.  Annotate associated CDS (Prokka product names, gene, locus tag)
+    10. Build final output table (all promoters, all metadata)
+    11. Generate HTML report
 """
 
 import argparse
@@ -87,7 +89,14 @@ _BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 
 
 def _parse_meme_file(filepath):
-    """Parse a MEME-format file. Returns {motif_name: [[pA, pC, pG, pT], ...]}."""
+    """Parse a MEME-format file. Returns {motif_name: [[pA, pC, pG, pT], ...]}.
+
+    The motif name is the first token following ``MOTIF``. For
+    ``all_unique_subgroups.meme`` these look like ``M001_m35``,
+    ``M001_m10``, ``M002_m35`` etc — the prefix before the underscore
+    identifies the subgroup, and the ``_m10`` / ``_m35`` suffix the
+    element type.
+    """
     motifs = {}
     current = None
     matrix = []
@@ -152,58 +161,79 @@ def _score_kmer(seq, pos, log_odds_matrix):
 
 
 class _MotifSet:
-    """A collection of species motifs for one element type (-10 or -35),
-    each with its own log-odds matrix and score threshold."""
+    """A collection of subgroup motifs for one element type (-10 or -35),
+    each with its own log-odds matrix and score threshold. Subgroup IDs
+    (e.g. ``M001``) are used to test for "linked" hits where a -10 and
+    a -35 come from the same subgroup."""
 
     def __init__(self):
-        self.entries = []  # list of (source, log_odds_matrix, threshold)
+        self.entries = []  # list of (subgroup, log_odds_matrix, threshold)
 
-    def add(self, source, freq_matrix, p_value):
+    def add(self, subgroup, freq_matrix, p_value):
         lom = _freq_to_log_odds(freq_matrix)
         thresh = _compute_score_threshold(lom, p_value)
-        self.entries.append((source, lom, thresh))
+        self.entries.append((subgroup, lom, thresh))
 
     def best_hit(self, seq, pos):
-        """Return (score, source) of the best-scoring motif that exceeds its
-        threshold at this position, or None."""
+        """Return (score, subgroup) of the best-scoring motif that exceeds
+        its threshold at this position, or None."""
         best = None
-        for source, lom, thresh in self.entries:
+        for subgroup, lom, thresh in self.entries:
             s = _score_kmer(seq, pos, lom)
             if s is not None and s >= thresh:
                 if best is None or s > best[0]:
-                    best = (s, source)
+                    best = (s, subgroup)
         return best
 
 
-def _load_motif_sets(motifs_dir, p10, p35_strict, p35_relaxed):
-    """Load all .meme files and build MotifSets for -10 and -35 elements."""
+def _load_motifs_from_file(meme_path, p10, p35):
+    """Load paired subgroup motifs from a single MEME file.
+
+    Expects motifs named ``<subgroup>_m10`` and ``<subgroup>_m35`` —
+    e.g. ``M001_m10`` / ``M001_m35``. Returns (m10, m35) MotifSets
+    where each entry's source is the subgroup ID.
+    """
     m10 = _MotifSet()
-    m35_strict = _MotifSet()
-    m35_relaxed = _MotifSet()
+    m35 = _MotifSet()
 
-    meme_files = sorted(Path(motifs_dir).glob("*.meme"))
-    if not meme_files:
-        print(f"  WARNING: no .meme files in {motifs_dir}", file=sys.stderr)
-        return m10, m35_strict, m35_relaxed
+    meme_path = Path(meme_path)
+    if not meme_path.is_file():
+        print(f"  WARNING: MEME file not found: {meme_path}", file=sys.stderr)
+        return m10, m35
 
-    for mf in meme_files:
-        source = mf.stem
-        motifs = _parse_meme_file(mf)
-        if "Minus10" in motifs:
-            m10.add(source, motifs["Minus10"], p10)
-        if "Minus35" in motifs:
-            m35_strict.add(source, motifs["Minus35"], p35_strict)
-            m35_relaxed.add(source, motifs["Minus35"], p35_relaxed)
+    motifs = _parse_meme_file(meme_path)
+    if not motifs:
+        print(f"  WARNING: no motifs parsed from {meme_path}", file=sys.stderr)
+        return m10, m35
 
-    n10 = len(m10.entries)
-    n35 = len(m35_strict.entries)
-    print(f"  Loaded {n10} Minus10 and {n35} Minus35 motifs from "
-          f"{len(meme_files)} files")
-    return m10, m35_strict, m35_relaxed
+    for name, matrix in motifs.items():
+        # Expected naming: "<subgroup>_m10" or "<subgroup>_m35"
+        if name.endswith("_m10"):
+            subgroup = name[:-4]
+            m10.add(subgroup, matrix, p10)
+        elif name.endswith("_m35"):
+            subgroup = name[:-4]
+            m35.add(subgroup, matrix, p35)
+
+    print(f"  Loaded {len(m10.entries)} -10 and {len(m35.entries)} -35 "
+          f"subgroup motifs from {meme_path.name}")
+    return m10, m35
 
 
-def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
-    """Scan one strand for promoter candidates. Returns list of result dicts."""
+def _find_promoters_on_strand(seq, m10, m35):
+    """Scan one strand for promoter candidates. Returns a list of result dicts.
+
+    Each -10 hit is classified into one of three paths, in priority
+    order:
+
+        A  Linked -10 and -35 (same subgroup) with 15–19 bp spacer.
+        B  Extended -10 (TG dinucleotide immediately upstream of the
+           hexamer), regardless of any -35 hit.
+        C  Unlinked -10 and -35 (different subgroups) with 15–19 bp
+           spacer.
+
+    Anything else is no hit and is dropped.
+    """
     w = _MOTIF_WIDTH
     max_pos = len(seq) - w
 
@@ -217,69 +247,68 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     if not hits_10:
         return []
 
-    # Pre-scan all -35 hits at both thresholds (indexed by position)
-    strict_by_pos = {}
-    relaxed_by_pos = {}
+    # Pre-scan all -35 hits
+    hits_35_by_pos = {}
     for i in range(max_pos + 1):
-        hit_s = m35_strict.best_hit(seq, i)
-        if hit_s:
-            strict_by_pos[i] = hit_s
-        hit_r = m35_relaxed.best_hit(seq, i)
-        if hit_r:
-            relaxed_by_pos[i] = hit_r
+        hit = m35.best_hit(seq, i)
+        if hit:
+            hits_35_by_pos[i] = hit
 
     results = []
-    for pos_10, score_10, source_10 in hits_10:
-        # Extended -10 check
+    for pos_10, score_10, subgroup_10 in hits_10:
         has_ext10 = pos_10 >= 2 and seq[pos_10 - 2:pos_10] == "TG"
 
-        best_35 = None
-        path = None
-
-        # Path A: strict -35 + spacing
+        # Collect -35 hits within the 15–19 bp spacer window. Split into
+        # linked (same subgroup) vs unlinked (different subgroup).
+        best_linked = None    # (score, subgroup, pos, spacer)
+        best_unlinked = None
         for spacer in range(_SPACER_MIN, _SPACER_MAX + 1):
             p35 = pos_10 - w - spacer
             if p35 < 0:
                 continue
-            if p35 in strict_by_pos:
-                s35, src35 = strict_by_pos[p35]
-                if best_35 is None or s35 > best_35[0]:
-                    best_35 = (s35, src35, p35, spacer)
-                    path = "A"
+            hit = hits_35_by_pos.get(p35)
+            if hit is None:
+                continue
+            s35, sub35 = hit
+            if sub35 == subgroup_10:
+                if best_linked is None or s35 > best_linked[0]:
+                    best_linked = (s35, sub35, p35, spacer)
+            else:
+                if best_unlinked is None or s35 > best_unlinked[0]:
+                    best_unlinked = (s35, sub35, p35, spacer)
 
-        # Path B: extended -10 with relaxed or absent -35
-        if best_35 is None and has_ext10:
-            for spacer in range(_SPACER_MIN, _SPACER_MAX + 1):
-                p35 = pos_10 - w - spacer
-                if p35 < 0:
-                    continue
-                if p35 in relaxed_by_pos:
-                    s35, src35 = relaxed_by_pos[p35]
-                    if best_35 is None or s35 > best_35[0]:
-                        best_35 = (s35, src35, p35, spacer)
-                        path = "B_with_35"
-
-            if best_35 is None:
-                path = "B_no_35"
-
-        if path is None:
+        # Classify this -10 hit: A > B > C, else drop.
+        if best_linked is not None:
+            path = "A"
+            chosen_35 = best_linked
+        elif has_ext10:
+            path = "B"
+            # For Path B the -35 is "variable or absent"; keep the best
+            # -35 in the 15–19 bp window if there is one, preferring a
+            # linked hit (there isn't one here by construction) then the
+            # best unlinked hit.
+            chosen_35 = best_unlinked
+        elif best_unlinked is not None:
+            path = "C"
+            chosen_35 = best_unlinked
+        else:
             continue
 
         r = {
             "pos_10": pos_10,
             "seq_10": seq[pos_10:pos_10 + w],
             "score_10": round(score_10, 3),
-            "source_10": source_10,
+            "source_10": subgroup_10,
             "has_ext10": has_ext10,
             "path": path,
         }
 
-        if best_35 is not None:
-            s35, src35, p35, spacer = best_35
+        if chosen_35 is not None:
+            s35, sub35, p35, spacer = chosen_35
             r["pos_35"] = p35
             r["seq_35"] = seq[p35:p35 + w]
             r["score_35"] = round(s35, 3)
-            r["source_35"] = src35
+            r["source_35"] = sub35
             r["spacer_len"] = spacer
             r["spacer_seq"] = seq[p35 + w:pos_10]
         else:
@@ -301,18 +330,18 @@ _MOTIF_COLUMNS = [
     "spacer_len", "spacer_seq", "path",
 ]
 
-_PATH_RANK = {"A": 0, "B_with_35": 1, "B_no_35": 2}
+_PATH_RANK = {"A": 0, "B": 1, "C": 2}
 
 
-def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
+def _scan_sequences_for_motifs(df, m10, m35,
                                seq_col="sequence_5p_to_3p",
                                id_col="igr_id"):
     """Scan a DataFrame of sequences for -10/-35 promoter motifs.
 
     Returns two DataFrames:
         all_hits  — every motif hit found (multiple rows per sequence possible)
-        best_hits — one row per sequence, keeping the best hit (Path A > B_with_35 > B_no_35,
-                     then highest -10 score)
+        best_hits — one row per sequence, keeping the best hit
+                    (Path A > B > C, then highest -10 score)
     """
     all_rows = []
     best_per_seq = {}  # igr_id -> (path_rank, neg_score_10, row_dict)
@@ -325,7 +354,7 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
         igr_id = row[id_col]
 
         for strand, seq in [("+", raw), ("-", _revcomp_simple(raw))]:
-            for r in _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
+            for r in _find_promoters_on_strand(seq, m10, m35):
                 out = {id_col: igr_id, "strand": strand}
                 for k in _MOTIF_COLUMNS:
                     if k != "strand":
@@ -978,14 +1007,20 @@ def _add_cds_column(df, contigs, n_bp):
 #  Step 8 — Motif-based promoter filtering
 #
 #  Scans promoter sequences for -10 and -35 hexamer motifs using PWMs
-#  from bundled .meme files (collectf, prodoric, regtransbase).
-#  A sequence is confirmed as a promoter candidate if it has:
-#    Path A: -10 hit + -35 hit with 15-19 bp spacer
-#    Path B: -10 hit + extended -10 TG dinucleotide + relaxed/absent -35
+#  from the bundled all_unique_subgroups.meme file, which contains
+#  paired M###_m10 / M###_m35 subgroups.
+#
+#  Each -10 hit is classified into one of three paths:
+#    A — linked -10 and -35 (same subgroup) with 15–19 bp spacer
+#    B — extended -10 (TG dinucleotide upstream) with variable or
+#        absent -35
+#    C — unlinked -10 and -35 (different subgroups) with 15–19 bp
+#        spacer
+#  Anything else is regarded as no hit.
 # =====================================================================
 
 def step08_scan_motifs(cfg: Config, force: bool = False):
-    """Scan promoter sequences for -10/-35 motifs and filter.
+    """Scan promoter sequences for -10/-35 motifs and classify as A/B/C.
 
     Writes into ``motifs/``:
     * ``motif_hits_all.tsv``       — all hits for all promoter-orientation IGRs
@@ -1005,39 +1040,41 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
         print("  Step 8 complete.\n")
         return
 
-    # Locate motifs directory
-    motifs_dir = cfg.motifs_dir
-    if motifs_dir is None or not motifs_dir.is_dir():
-        bundled = Path(__file__).parent / "motifs"
-        if bundled.is_dir():
-            motifs_dir = bundled
+    # Locate MEME file
+    meme_file = cfg.meme_file
+    if meme_file is None or not Path(meme_file).is_file():
+        bundled = Path(__file__).parent / "all_unique_subgroups.meme"
+        if bundled.is_file():
+            meme_file = bundled
         else:
-            print("── No motifs directory found, skipping motif scan ──")
+            print("── No MEME file found, skipping motif scan ──")
             pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
             print("  Step 8 complete.\n")
             return
 
-    # Load motif sets with configured p-value thresholds
+    # Load paired subgroup motifs
     p10 = cfg.motif_p10
     p35 = cfg.motif_p35
-    p35_relaxed = cfg.motif_p35_relaxed
-    print(f"── Loading motifs (p10={p10}, p35={p35}, p35_relaxed={p35_relaxed}) ──")
-    m10, m35_strict, m35_relaxed = _load_motif_sets(motifs_dir, p10, p35, p35_relaxed)
+    print(f"── Loading motifs from {Path(meme_file).name} "
+          f"(p10={p10}, p35={p35}) ──")
+    m10, m35 = _load_motifs_from_file(meme_file, p10, p35)
 
     if not m10.entries:
-        print("  No Minus10 motifs loaded — cannot scan.")
+        print("  No -10 motifs loaded — cannot scan.")
         pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
         print("  Step 8 complete.\n")
         return
 
-    # Report thresholds
-    print("  Score thresholds:")
-    for source, lom, thresh in m10.entries:
-        print(f"    -10 [{source}]: >= {thresh:.3f} (p < {p10})")
-    for source, lom, thresh in m35_strict.entries:
-        print(f"    -35 strict [{source}]: >= {thresh:.3f} (p < {p35})")
-    for source, lom, thresh in m35_relaxed.entries:
-        print(f"    -35 relaxed [{source}]: >= {thresh:.3f} (p < {p35_relaxed})")
+    # Report threshold ranges (one per subgroup is noisy to print, so
+    # summarise across all subgroups).
+    t10 = [thresh for _, _, thresh in m10.entries]
+    t35 = [thresh for _, _, thresh in m35.entries]
+    if t10:
+        print(f"  -10 score thresholds: {min(t10):.3f} – {max(t10):.3f} "
+              f"(p < {p10}, n={len(t10)} subgroups)")
+    if t35:
+        print(f"  -35 score thresholds: {min(t35):.3f} – {max(t35):.3f} "
+              f"(p < {p35}, n={len(t35)} subgroups)")
 
     # --- Scan ALL promoter-orientation IGRs ---
     try:
@@ -1063,8 +1100,7 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
     )
 
     print(f"\n  Scanning {len(all_igr)} promoter-orientation IGRs...")
-    all_hits, best_all = _scan_sequences_for_motifs(
-        all_igr, m10, m35_strict, m35_relaxed)
+    all_hits, best_all = _scan_sequences_for_motifs(all_igr, m10, m35)
 
     all_hits.to_csv(cfg.motif_hits_all, sep="\t", index=False)
     best_all.to_csv(cfg.motif_best_all, sep="\t", index=False)
@@ -1105,8 +1141,7 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
         )
 
     print(f"\n  Scanning {len(markers_df)} marker promoters...")
-    marker_hits, best_markers = _scan_sequences_for_motifs(
-        markers_df, m10, m35_strict, m35_relaxed)
+    marker_hits, best_markers = _scan_sequences_for_motifs(markers_df, m10, m35)
 
     marker_hits.to_csv(cfg.motif_hits_markers, sep="\t", index=False)
     best_markers.to_csv(cfg.motif_best_markers, sep="\t", index=False)
@@ -1671,17 +1706,17 @@ def step10_final_table(cfg: Config, force: bool = False):
     product               Protein product name from Prokka GFF
     is_marker             Whether this IGR flanks a marker-operon gene
     motif_confirmed       Whether a -10/-35 motif combination was found
-    motif_path            Motif path (A, B_with_35, B_no_35)
+    motif_path            Motif path classification (A, B, or C)
     motif_strand          Strand on which best motif hit was found
     motif_pos_10          Position of -10 element in scanned sequence
     motif_seq_10          Sequence of -10 element
     motif_score_10        Log-odds score of -10 hit
-    motif_source_10       Database source of -10 hit
+    motif_source_10       Subgroup ID of the best -10 hit (e.g. M001)
     motif_has_ext10       Whether extended -10 TG dinucleotide is present
     motif_pos_35          Position of -35 element
     motif_seq_35          Sequence of -35 element
     motif_score_35        Log-odds score of -35 hit
-    motif_source_35       Database source of -35 hit
+    motif_source_35       Subgroup ID of the best -35 hit (e.g. M001)
     motif_spacer_len      Spacer length between -35 and -10
     motif_spacer_seq      Spacer sequence
     sequence_5p_to_3p     Full promoter sequence oriented 5'→3'
@@ -1851,18 +1886,16 @@ def main():
                              "(default: bundled profiles)")
 
     # Motif scanning
-    parser.add_argument("--motifs-dir", type=Path, default=None,
-                        help="Directory containing .meme motif files "
-                             "(default: bundled motifs/)")
+    parser.add_argument("--meme-file", type=Path, default=None,
+                        help="Single MEME file with paired M###_m10 / "
+                             "M###_m35 subgroup motifs "
+                             "(default: bundled all_unique_subgroups.meme)")
     parser.add_argument("--p10", type=float, default=2.5e-3,
                         help="p-value threshold for -10 motif hits "
                              "(default: 0.0025)")
     parser.add_argument("--p35", type=float, default=2.5e-3,
                         help="p-value threshold for -35 motif hits "
                              "(default: 0.0025)")
-    parser.add_argument("--p35-relaxed", type=float, default=0.05,
-                        help="Relaxed -35 p-value threshold when extended "
-                             "-10 TG is present (default: 0.05)")
 
     # Conda environments
     parser.add_argument("--conda-prokka", default="",
@@ -1949,10 +1982,9 @@ def _build_config(args, kingdom, *, input_fasta, output_dir, prokka_prefix=None)
         max_internal_distance=args.max_internal_dist,
         min_flanking_distance=args.min_flanking_dist,
         hmm_bitscore_min=args.hmm_bitscore,
-        motifs_dir=args.motifs_dir,
+        meme_file=args.meme_file,
         motif_p10=args.p10,
         motif_p35=args.p35,
-        motif_p35_relaxed=args.p35_relaxed,
         cds_bp=args.cds_bp,
     )
 
