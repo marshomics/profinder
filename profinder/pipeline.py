@@ -12,10 +12,10 @@ motifs using position weight matrices from the bundled
 ``all_unique_subgroups.meme`` file. Paths A–C require a -35 hit with
 a 15–19 bp spacer to the -10 hit; Path D requires only an extended
 -10. Each -10 hit is classified as Path A (linked strict -35, same
-subgroup), Path B (extended -10 with a relaxed -35, any subgroup),
-Path C (unlinked strict -35, different subgroup), or Path D
-(extended -10 with no -35 in the spacer window). Anything else is no
-hit.
+subgroup), Path B (extended -10 with a linked relaxed -35, same
+subgroup), Path C (unlinked strict -35, different subgroup), or Path
+D (extended -10 with no -35 in the spacer window). Anything else is
+no hit.
 
 Usage
 -----
@@ -188,6 +188,18 @@ class _MotifSet:
                     best = (s, subgroup)
         return best
 
+    def hit_for_subgroup(self, seq, pos, subgroup):
+        """Return the score for a specific subgroup's motif at this
+        position if it exceeds that subgroup's threshold, else None."""
+        for sub, lom, thresh in self.entries:
+            if sub != subgroup:
+                continue
+            s = _score_kmer(seq, pos, lom)
+            if s is not None and s >= thresh:
+                return s
+            return None
+        return None
+
 
 def _load_motifs_from_file(meme_path, p10, p35_strict, p35_relaxed):
     """Load paired subgroup motifs from a single MEME file.
@@ -236,7 +248,7 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     requires only an extended -10:
 
         A  Linked -10 and strict -35 (same subgroup).
-        B  Extended -10 (TG at -2/-1) plus a relaxed -35 (any subgroup).
+        B  Extended -10 (TG at -2/-1) plus a linked relaxed -35 (same subgroup).
         C  Unlinked -10 and strict -35 (different subgroups).
         D  Extended -10 with no -35 in the 15–19 bp window.
 
@@ -255,27 +267,26 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     if not hits_10:
         return []
 
-    # Pre-scan all -35 hits at both thresholds, indexed by position.
+    # Pre-scan strict -35 hits (best across subgroups) by position.
+    # Relaxed -35 is looked up per-subgroup directly (see below), since
+    # Path B requires the relaxed -35 to come from the same subgroup as
+    # the -10 hit.
     strict_by_pos = {}
-    relaxed_by_pos = {}
     for i in range(max_pos + 1):
         hit_s = m35_strict.best_hit(seq, i)
         if hit_s:
             strict_by_pos[i] = hit_s
-        hit_r = m35_relaxed.best_hit(seq, i)
-        if hit_r:
-            relaxed_by_pos[i] = hit_r
 
     results = []
     for pos_10, score_10, subgroup_10 in hits_10:
         has_ext10 = pos_10 >= 2 and seq[pos_10 - 2:pos_10] == "TG"
 
         # Walk the 15–19 bp spacer window once, tracking:
-        #   best_linked_strict  — same subgroup, strict threshold (Path A)
-        #   best_relaxed_any    — any subgroup, relaxed threshold (Path B)
+        #   best_linked_strict   — same subgroup, strict threshold (Path A)
+        #   best_linked_relaxed  — same subgroup, relaxed threshold (Path B)
         #   best_unlinked_strict — different subgroup, strict threshold (Path C)
         best_linked_strict = None
-        best_relaxed_any = None
+        best_linked_relaxed = None
         best_unlinked_strict = None
         for spacer in range(_SPACER_MIN, _SPACER_MAX + 1):
             p35 = pos_10 - w - spacer
@@ -292,19 +303,19 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
                     if best_unlinked_strict is None or s35 > best_unlinked_strict[0]:
                         best_unlinked_strict = (s35, sub35, p35, spacer)
 
-            r_hit = relaxed_by_pos.get(p35)
-            if r_hit is not None:
-                s35, sub35 = r_hit
-                if best_relaxed_any is None or s35 > best_relaxed_any[0]:
-                    best_relaxed_any = (s35, sub35, p35, spacer)
+            # Same-subgroup relaxed -35 lookup for Path B.
+            r_score = m35_relaxed.hit_for_subgroup(seq, p35, subgroup_10)
+            if r_score is not None:
+                if best_linked_relaxed is None or r_score > best_linked_relaxed[0]:
+                    best_linked_relaxed = (r_score, subgroup_10, p35, spacer)
 
         # Classify this -10 hit: A > B > C > D, else drop.
         if best_linked_strict is not None:
             path = "A"
             chosen_35 = best_linked_strict
-        elif has_ext10 and best_relaxed_any is not None:
+        elif has_ext10 and best_linked_relaxed is not None:
             path = "B"
-            chosen_35 = best_relaxed_any
+            chosen_35 = best_linked_relaxed
         elif best_unlinked_strict is not None:
             path = "C"
             chosen_35 = best_unlinked_strict
@@ -1034,8 +1045,8 @@ def _add_cds_column(df, contigs, n_bp):
 #  require a -35 hit with a 15–19 bp spacer to the -10 hit; Path D
 #  requires only an extended -10.
 #    A — linked -10 and strict -35 (same subgroup)
-#    B — extended -10 (TG dinucleotide at -2/-1) and a relaxed -35
-#        (any subgroup)
+#    B — extended -10 (TG dinucleotide at -2/-1) and a linked
+#        relaxed -35 (same subgroup)
 #    C — unlinked -10 and strict -35 (different subgroups)
 #    D — extended -10 with no -35 in the 15–19 bp window
 #  Anything else is regarded as no hit.
@@ -1505,7 +1516,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
     <div class="legend">
         <strong>Motif path:</strong>
         <span class="legend-item"><span class="path path-a">A</span> linked &minus;10/&minus;35 (same subgroup), 15&ndash;19 bp</span>
-        <span class="legend-item"><span class="path path-b">B</span> extended &minus;10 + relaxed &minus;35, 15&ndash;19 bp</span>
+        <span class="legend-item"><span class="path path-b">B</span> extended &minus;10 + linked relaxed &minus;35 (same subgroup), 15&ndash;19 bp</span>
         <span class="legend-item"><span class="path path-c">C</span> unlinked &minus;10/&minus;35 (different subgroups), 15&ndash;19 bp</span>
         <span class="legend-item"><span class="path path-d">D</span> extended &minus;10, no &minus;35 in window</span>
     </div>
