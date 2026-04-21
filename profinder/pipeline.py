@@ -9,11 +9,13 @@ and outputs promoter sequences in 5'-to-3' orientation.
 Use ``--domain bacteria`` (default) or ``--domain archaea``.
 Promoter verification is performed by scanning for -10/-35 hexamer
 motifs using position weight matrices from the bundled
-``all_unique_subgroups.meme`` file. All three paths require a -35
-hit with a 15–19 bp spacer to the -10 hit. Each -10 hit is
-classified as Path A (linked strict -35, same subgroup), Path B
-(extended -10 with a relaxed -35, any subgroup), or Path C
-(unlinked strict -35, different subgroup). Anything else is no hit.
+``all_unique_subgroups.meme`` file. Paths A–C require a -35 hit with
+a 15–19 bp spacer to the -10 hit; Path D requires only an extended
+-10. Each -10 hit is classified as Path A (linked strict -35, same
+subgroup), Path B (extended -10 with a relaxed -35, any subgroup),
+Path C (unlinked strict -35, different subgroup), or Path D
+(extended -10 with no -35 in the spacer window). Anything else is no
+hit.
 
 Usage
 -----
@@ -45,7 +47,7 @@ Steps
     5.  Filter HMM output
     6.  Filter operons and add marker info
     7.  Match IGRs to marker operons
-    8.  Scan promoter motifs (-10/-35 hexamer verification, A/B/C)
+    8.  Scan promoter motifs (-10/-35 hexamer verification, A/B/C/D)
     9.  Annotate associated CDS (Prokka product names, gene, locus tag)
     10. Build final output table (all promoters, all metadata)
     11. Generate HTML report
@@ -229,12 +231,14 @@ def _load_motifs_from_file(meme_path, p10, p35_strict, p35_relaxed):
 def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     """Scan one strand for promoter candidates. Returns a list of result dicts.
 
-    Each -10 hit is classified into one of three paths, in priority
-    order. All three require a -35 hit with a 15–19 bp spacer:
+    Each -10 hit is classified into one of four paths, in priority
+    order. Paths A–C require a -35 hit with a 15–19 bp spacer; Path D
+    requires only an extended -10:
 
         A  Linked -10 and strict -35 (same subgroup).
         B  Extended -10 (TG at -2/-1) plus a relaxed -35 (any subgroup).
         C  Unlinked -10 and strict -35 (different subgroups).
+        D  Extended -10 with no -35 in the 15–19 bp window.
 
     Anything else is no hit and is dropped.
     """
@@ -294,7 +298,7 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
                 if best_relaxed_any is None or s35 > best_relaxed_any[0]:
                     best_relaxed_any = (s35, sub35, p35, spacer)
 
-        # Classify this -10 hit: A > B > C, else drop.
+        # Classify this -10 hit: A > B > C > D, else drop.
         if best_linked_strict is not None:
             path = "A"
             chosen_35 = best_linked_strict
@@ -304,6 +308,9 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
         elif best_unlinked_strict is not None:
             path = "C"
             chosen_35 = best_unlinked_strict
+        elif has_ext10:
+            path = "D"
+            chosen_35 = None  # no -35 in the spacer window
         else:
             continue
 
@@ -343,7 +350,7 @@ _MOTIF_COLUMNS = [
     "spacer_len", "spacer_seq", "path",
 ]
 
-_PATH_RANK = {"A": 0, "B": 1, "C": 2}
+_PATH_RANK = {"A": 0, "B": 1, "C": 2, "D": 3}
 
 
 def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
@@ -354,7 +361,7 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
     Returns two DataFrames:
         all_hits  — every motif hit found (multiple rows per sequence possible)
         best_hits — one row per sequence, keeping the best hit
-                    (Path A > B > C, then highest -10 score)
+                    (Path A > B > C > D, then highest -10 score)
     """
     all_rows = []
     best_per_seq = {}  # igr_id -> (path_rank, neg_score_10, row_dict)
@@ -1023,17 +1030,19 @@ def _add_cds_column(df, contigs, n_bp):
 #  from the bundled all_unique_subgroups.meme file, which contains
 #  paired M###_m10 / M###_m35 subgroups.
 #
-#  Each -10 hit is classified into one of three paths. All three
-#  require a -35 hit with a 15–19 bp spacer to the -10 hit.
+#  Each -10 hit is classified into one of four paths. Paths A–C
+#  require a -35 hit with a 15–19 bp spacer to the -10 hit; Path D
+#  requires only an extended -10.
 #    A — linked -10 and strict -35 (same subgroup)
 #    B — extended -10 (TG dinucleotide at -2/-1) and a relaxed -35
 #        (any subgroup)
 #    C — unlinked -10 and strict -35 (different subgroups)
+#    D — extended -10 with no -35 in the 15–19 bp window
 #  Anything else is regarded as no hit.
 # =====================================================================
 
 def step08_scan_motifs(cfg: Config, force: bool = False):
-    """Scan promoter sequences for -10/-35 motifs and classify as A/B/C.
+    """Scan promoter sequences for -10/-35 motifs and classify as A/B/C/D.
 
     Writes into ``motifs/``:
     * ``motif_hits_all.tsv``       — all hits for all promoter-orientation IGRs
@@ -1434,11 +1443,11 @@ def step11_generate_report(cfg: Config, force: bool = False):
     # These columns were added by step 8 when writing promoter_markers_verified.tsv
     has_motif_cols = "motif_pos_10" in promoter_df.columns
 
-    # Sort rows by motif path priority (A > B > C > other), then by
-    # -10 score descending, so the strongest evidence appears first.
+    # Sort rows by motif path priority (A > B > C > D > other), then
+    # by -10 score descending, so the strongest evidence appears first.
     if has_motif_cols:
         def _path_rank(v):
-            return {"A": 0, "B": 1, "C": 2}.get(str(v).strip(), 3)
+            return {"A": 0, "B": 1, "C": 2, "D": 3}.get(str(v).strip(), 4)
 
         def _score_key(v):
             try:
@@ -1498,6 +1507,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
         <span class="legend-item"><span class="path path-a">A</span> linked &minus;10/&minus;35 (same subgroup), 15&ndash;19 bp</span>
         <span class="legend-item"><span class="path path-b">B</span> extended &minus;10 + relaxed &minus;35, 15&ndash;19 bp</span>
         <span class="legend-item"><span class="path path-c">C</span> unlinked &minus;10/&minus;35 (different subgroups), 15&ndash;19 bp</span>
+        <span class="legend-item"><span class="path path-d">D</span> extended &minus;10, no &minus;35 in window</span>
     </div>
     <div class="legend">
         <strong>Motif diagram:</strong>
@@ -1589,7 +1599,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
 
         # Motif details
         motif_path = str(row.get("motif_path", "")).strip() if has_motif_cols else ""
-        path_key = motif_path if motif_path in ("A", "B", "C") else ""
+        path_key = motif_path if motif_path in ("A", "B", "C", "D") else ""
         if path_key:
             path_cell = f'<span class="path path-{path_key.lower()}">{path_key}</span>'
             row_class = f"row-{path_key.lower()}"
@@ -1708,11 +1718,13 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
     .path-a {{ background: #e8f5e9; color: #2e7d32; }}
     .path-b {{ background: #fff8e1; color: #e65100; }}
     .path-c {{ background: #ffebee; color: #c62828; }}
+    .path-d {{ background: #eceff1; color: #546e7a; }}
     .path-none {{ background: #f5f5f5; color: #999; }}
     tr.row-a {{ background: #f4faf4; }}
     tr.row-b {{ background: #fffcf2; }}
     tr.row-c {{ background: #fdf4f4; }}
-    tr.row-a:hover, tr.row-b:hover, tr.row-c:hover {{ background: #eef4ef; }}
+    tr.row-d {{ background: #f6f8f9; }}
+    tr.row-a:hover, tr.row-b:hover, tr.row-c:hover, tr.row-d:hover {{ background: #eef4ef; }}
     .na {{ color: #bbb; }}
     small {{ color: #888; }}
     footer {{
