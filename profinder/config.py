@@ -56,7 +56,8 @@ class Config:
     meme_file: Path = None           # single .meme file holding paired
                                      # M###_m10 / M###_m35 subgroup motifs
     motif_p10: float = 2.5e-3        # p-value threshold for -10 hits
-    motif_p35: float = 2.5e-3        # p-value threshold for -35 hits
+    motif_p35: float = 2.5e-3        # strict -35 threshold (Path A, Path C)
+    motif_p35_relaxed: float = 0.05  # relaxed -35 threshold (Path B only)
 
     def __post_init__(self):
         """Resolve bundled HMM and MEME paths if none were provided."""
