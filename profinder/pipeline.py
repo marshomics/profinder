@@ -1553,6 +1553,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
         <th>Motif path</th>
         <th>&minus;10</th>
         <th>&minus;35</th>
+        <th title="Sum of -10 and -35 log-odds scores — the sort key within each path group">Combined score</th>
         <th>Spacer</th>
         <th>Associated CDS</th>
         <th>Protein</th>
@@ -1644,6 +1645,20 @@ def step11_generate_report(cfg: Config, force: bool = False):
 
         spacer_cell = str(spacer_len) if spacer_len and str(spacer_len) != "." else '<span class="na">—</span>'
 
+        # Combined -10+-35 log-odds score (the within-group sort key).
+        # Path D rows have no -35 and display an em-dash.
+        def _to_float(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        s10_f = _to_float(score_10)
+        s35_f = _to_float(score_35)
+        if s10_f is not None and s35_f is not None:
+            combined_cell = f"{s10_f + s35_f:.3f}"
+        else:
+            combined_cell = '<span class="na">—</span>'
+
         product_cell = html_mod.escape(product) if product else '<span class="na">—</span>'
 
         html_parts.append(f"""
@@ -1656,6 +1671,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
             <td>{path_cell}</td>
             <td>{minus10_cell}</td>
             <td>{minus35_cell}</td>
+            <td>{combined_cell}</td>
             <td>{spacer_cell}</td>
             <td><code>{html_mod.escape(str(gene))}</code></td>
             <td>{product_cell}</td>
