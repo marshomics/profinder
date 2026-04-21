@@ -53,16 +53,20 @@ class Config:
                                       # profinder_results.tsv (0 = disabled)
 
     # ── Motif scanning parameters ────────────────────────────────────
-    motifs_dir: Path = None           # directory containing .meme files
+    meme_file: Path = None           # single .meme file holding paired
+                                     # M###_m10 / M###_m35 subgroup motifs
     motif_p10: float = 2.5e-3        # p-value threshold for -10 hits
-    motif_p35: float = 2.5e-3        # p-value threshold for -35 hits (strict)
-    motif_p35_relaxed: float = 0.05  # relaxed -35 threshold when ext -10 present
+    motif_p35: float = 2.5e-3        # p-value threshold for -35 hits
 
     def __post_init__(self):
-        """Resolve bundled HMM path if none was provided."""
+        """Resolve bundled HMM and MEME paths if none were provided."""
         if self.hmm_profiles_dir is None:
             candidate = Path(__file__).parent / "hmms"
             self.hmm_profiles_dir = candidate if candidate.is_dir() else None
+
+        if self.meme_file is None:
+            candidate = Path(__file__).parent / "all_unique_subgroups.meme"
+            self.meme_file = candidate if candidate.is_file() else None
 
         # Normalise domain to lowercase
         self.domain = self.domain.lower()
