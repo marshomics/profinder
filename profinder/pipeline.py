@@ -15,7 +15,11 @@ a 15–19 bp spacer to the -10 hit; Path D requires only an extended
 subgroup), Path B (extended -10 with a linked relaxed -35, same
 subgroup), Path C (unlinked strict -35, different subgroup), or Path
 D (extended -10 with no -35 in the spacer window). Anything else is
-no hit.
+no hit. Within each path group, rows are ranked by the combined
+empirical significance -log10(p10) + -log10(p35), where each p-value
+is the fraction of 4^w k-mers scoring at least as high under that
+subgroup's PWM — a per-PWM measure that is comparable across
+subgroups with differing information content.
 
 Usage
 -----
@@ -54,6 +58,7 @@ Steps
 """
 
 import argparse
+import bisect
 import html as html_mod
 import math
 import re
@@ -140,16 +145,45 @@ def _freq_to_log_odds(freq_matrix, bg=0.25, pseudocount=1e-6):
             for row in freq_matrix]
 
 
-def _compute_score_threshold(log_odds_matrix, p_value):
-    """Compute score threshold for a given p-value by enumerating all 4^w k-mers."""
+def _enumerate_pwm_scores(log_odds_matrix):
+    """Return the ascending-sorted array of all 4^w possible k-mer scores
+    under this PWM (uniform 0.25 background). Enables both threshold
+    lookup and empirical p-value lookup via binary search."""
     w = len(log_odds_matrix)
-    scores = sorted(
-        [sum(log_odds_matrix[i][b] for i, b in enumerate(kmer))
-         for kmer in iprod(range(4), repeat=w)],
-        reverse=True,
+    scores = [sum(log_odds_matrix[i][b] for i, b in enumerate(kmer))
+              for kmer in iprod(range(4), repeat=w)]
+    scores.sort()  # ascending
+    return scores
+
+
+def _threshold_from_sorted_scores(sorted_scores_asc, p_value):
+    """Score threshold such that approximately ``p_value`` fraction of
+    k-mers score ≥ threshold. Uses the ceiling so the realised
+    false-positive rate is at most slightly above the target."""
+    n = len(sorted_scores_asc)
+    k = max(1, min(int(math.ceil(p_value * n)), n))
+    return sorted_scores_asc[n - k]
+
+
+def _pvalue_from_sorted_scores(sorted_scores_asc, score):
+    """Empirical p-value for ``score`` under this PWM: fraction of all
+    4^w k-mers that score at least ``score``. Returns 1/n for scores
+    higher than every enumerated k-mer (floor for ``-log10(p)``)."""
+    n = len(sorted_scores_asc)
+    idx = bisect.bisect_left(sorted_scores_asc, score)
+    n_ge = n - idx
+    if n_ge <= 0:
+        return 1.0 / n
+    return n_ge / n
+
+
+def _compute_score_threshold(log_odds_matrix, p_value):
+    """Backwards-compatible wrapper: enumerate, then threshold. Prefer
+    enumerating once and calling the helpers above directly when the
+    sorted array will be reused (see ``_MotifSet``)."""
+    return _threshold_from_sorted_scores(
+        _enumerate_pwm_scores(log_odds_matrix), p_value
     )
-    rank = max(0, min(int(math.ceil(p_value * len(scores))) - 1, len(scores) - 1))
-    return scores[rank]
 
 
 def _score_kmer(seq, pos, log_odds_matrix):
@@ -170,33 +204,45 @@ class _MotifSet:
     a -35 come from the same subgroup."""
 
     def __init__(self):
-        self.entries = []  # list of (subgroup, log_odds_matrix, threshold)
+        # list of (subgroup, log_odds_matrix, threshold, sorted_scores_asc)
+        self.entries = []
 
     def add(self, subgroup, freq_matrix, p_value):
         lom = _freq_to_log_odds(freq_matrix)
-        thresh = _compute_score_threshold(lom, p_value)
-        self.entries.append((subgroup, lom, thresh))
+        sorted_scores = _enumerate_pwm_scores(lom)
+        thresh = _threshold_from_sorted_scores(sorted_scores, p_value)
+        self.entries.append((subgroup, lom, thresh, sorted_scores))
 
     def best_hit(self, seq, pos):
-        """Return (score, subgroup) of the best-scoring motif that exceeds
-        its threshold at this position, or None."""
+        """Return (score, subgroup, pvalue) of the best-scoring motif
+        that exceeds its threshold at this position, or None. The
+        p-value is empirical — the fraction of 4^w k-mers for that
+        subgroup's PWM scoring at least this high — and is therefore
+        comparable across PWMs with differing information content."""
         best = None
-        for subgroup, lom, thresh in self.entries:
+        best_scores_arr = None
+        for subgroup, lom, thresh, sorted_scores in self.entries:
             s = _score_kmer(seq, pos, lom)
             if s is not None and s >= thresh:
                 if best is None or s > best[0]:
                     best = (s, subgroup)
-        return best
+                    best_scores_arr = sorted_scores
+        if best is None:
+            return None
+        pv = _pvalue_from_sorted_scores(best_scores_arr, best[0])
+        return (best[0], best[1], pv)
 
     def hit_for_subgroup(self, seq, pos, subgroup):
-        """Return the score for a specific subgroup's motif at this
-        position if it exceeds that subgroup's threshold, else None."""
-        for sub, lom, thresh in self.entries:
+        """Return (score, pvalue) for a specific subgroup's motif at
+        this position if it exceeds that subgroup's threshold, else
+        None."""
+        for sub, lom, thresh, sorted_scores in self.entries:
             if sub != subgroup:
                 continue
             s = _score_kmer(seq, pos, lom)
             if s is not None and s >= thresh:
-                return s
+                pv = _pvalue_from_sorted_scores(sorted_scores, s)
+                return (s, pv)
             return None
         return None
 
@@ -262,7 +308,8 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     for i in range(max_pos + 1):
         hit = m10.best_hit(seq, i)
         if hit:
-            hits_10.append((i, hit[0], hit[1]))
+            # hit = (score, subgroup, pvalue)
+            hits_10.append((i, hit[0], hit[1], hit[2]))
 
     if not hits_10:
         return []
@@ -275,16 +322,17 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     for i in range(max_pos + 1):
         hit_s = m35_strict.best_hit(seq, i)
         if hit_s:
-            strict_by_pos[i] = hit_s
+            strict_by_pos[i] = hit_s  # (score, subgroup, pvalue)
 
     results = []
-    for pos_10, score_10, subgroup_10 in hits_10:
+    for pos_10, score_10, subgroup_10, pvalue_10 in hits_10:
         has_ext10 = pos_10 >= 2 and seq[pos_10 - 2:pos_10] == "TG"
 
         # Walk the 15–19 bp spacer window once, tracking:
         #   best_linked_strict   — same subgroup, strict threshold (Path A)
         #   best_linked_relaxed  — same subgroup, relaxed threshold (Path B)
         #   best_unlinked_strict — different subgroup, strict threshold (Path C)
+        # Each candidate tuple is (score, subgroup, pvalue, pos, spacer).
         best_linked_strict = None
         best_linked_relaxed = None
         best_unlinked_strict = None
@@ -295,19 +343,20 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
 
             s_hit = strict_by_pos.get(p35)
             if s_hit is not None:
-                s35, sub35 = s_hit
+                s35, sub35, pv35 = s_hit
                 if sub35 == subgroup_10:
                     if best_linked_strict is None or s35 > best_linked_strict[0]:
-                        best_linked_strict = (s35, sub35, p35, spacer)
+                        best_linked_strict = (s35, sub35, pv35, p35, spacer)
                 else:
                     if best_unlinked_strict is None or s35 > best_unlinked_strict[0]:
-                        best_unlinked_strict = (s35, sub35, p35, spacer)
+                        best_unlinked_strict = (s35, sub35, pv35, p35, spacer)
 
             # Same-subgroup relaxed -35 lookup for Path B.
-            r_score = m35_relaxed.hit_for_subgroup(seq, p35, subgroup_10)
-            if r_score is not None:
+            r_hit = m35_relaxed.hit_for_subgroup(seq, p35, subgroup_10)
+            if r_hit is not None:
+                r_score, r_pv = r_hit
                 if best_linked_relaxed is None or r_score > best_linked_relaxed[0]:
-                    best_linked_relaxed = (r_score, subgroup_10, p35, spacer)
+                    best_linked_relaxed = (r_score, subgroup_10, r_pv, p35, spacer)
 
         # Classify this -10 hit: A > B > C > D, else drop.
         if best_linked_strict is not None:
@@ -329,16 +378,18 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
             "pos_10": pos_10,
             "seq_10": seq[pos_10:pos_10 + w],
             "score_10": round(score_10, 3),
+            "pvalue_10": pvalue_10,
             "source_10": subgroup_10,
             "has_ext10": has_ext10,
             "path": path,
         }
 
         if chosen_35 is not None:
-            s35, sub35, p35, spacer = chosen_35
+            s35, sub35, pv35, p35, spacer = chosen_35
             r["pos_35"] = p35
             r["seq_35"] = seq[p35:p35 + w]
             r["score_35"] = round(s35, 3)
+            r["pvalue_35"] = pv35
             r["source_35"] = sub35
             r["spacer_len"] = spacer
             r["spacer_seq"] = seq[p35 + w:pos_10]
@@ -346,6 +397,7 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
             r["pos_35"] = "."
             r["seq_35"] = "."
             r["score_35"] = "."
+            r["pvalue_35"] = "."
             r["source_35"] = "."
             r["spacer_len"] = "."
             r["spacer_seq"] = "."
@@ -356,10 +408,23 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
 
 
 _MOTIF_COLUMNS = [
-    "strand", "pos_10", "seq_10", "score_10", "source_10",
-    "has_ext10", "pos_35", "seq_35", "score_35", "source_35",
+    "strand", "pos_10", "seq_10", "score_10", "pvalue_10", "source_10",
+    "has_ext10", "pos_35", "seq_35", "score_35", "pvalue_35", "source_35",
     "spacer_len", "spacer_seq", "path",
 ]
+
+
+def _neg_log10_p_combined(r):
+    """Within-path sort key: -log10(p10) + -log10(p35) when both exist,
+    else -log10(p10) alone (Path D). Higher = more significant."""
+    pv10 = r.get("pvalue_10")
+    pv35 = r.get("pvalue_35")
+    if not isinstance(pv10, (int, float)) or pv10 <= 0:
+        return float("-inf")
+    val = -math.log10(pv10)
+    if isinstance(pv35, (int, float)) and pv35 > 0:
+        val += -math.log10(pv35)
+    return val
 
 _PATH_RANK = {"A": 0, "B": 1, "C": 2, "D": 3}
 
@@ -372,10 +437,14 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
     Returns two DataFrames:
         all_hits  — every motif hit found (multiple rows per sequence possible)
         best_hits — one row per sequence, keeping the best hit
-                    (Path A > B > C > D, then highest -10 score)
+                    (Path A > B > C > D, then highest combined
+                    -log10(p-10) + -log10(p-35); -log10(p-10) alone
+                    for Path D)
     """
     all_rows = []
-    best_per_seq = {}  # igr_id -> (path_rank, neg_score_10, row_dict)
+    # igr_id -> (path_rank, neg_combined_neglogp, row_dict). Higher
+    # -log10(p) is more significant, so we negate for min-comparison.
+    best_per_seq = {}
 
     for _, row in df.iterrows():
         raw = row[seq_col]
@@ -393,10 +462,10 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
                 all_rows.append(out)
 
                 path_rank = _PATH_RANK.get(r["path"], 99)
-                s10 = r["score_10"] if isinstance(r["score_10"], float) else 0.0
+                neglogp = _neg_log10_p_combined(r)
                 prev = best_per_seq.get(igr_id)
-                if prev is None or (path_rank, -s10) < (prev[0], prev[1]):
-                    best_per_seq[igr_id] = (path_rank, -s10, out)
+                if prev is None or (path_rank, -neglogp) < (prev[0], prev[1]):
+                    best_per_seq[igr_id] = (path_rank, -neglogp, out)
 
     all_hits = pd.DataFrame(all_rows) if all_rows else pd.DataFrame(columns=[id_col] + _MOTIF_COLUMNS)
     best_rows = [v[2] for v in best_per_seq.values()]
@@ -1050,6 +1119,12 @@ def _add_cds_column(df, contigs, n_bp):
 #    C — unlinked -10 and strict -35 (different subgroups)
 #    D — extended -10 with no -35 in the 15–19 bp window
 #  Anything else is regarded as no hit.
+#
+#  Each hit also carries an empirical p-value, computed per PWM as
+#  the fraction of 4^w k-mers scoring at least as high. The best hit
+#  per IGR and the HTML report rank within each path group by
+#  -log10(p10) + -log10(p35), a cross-PWM-comparable joint
+#  significance. Path D rows use -log10(p10) alone.
 # =====================================================================
 
 def step08_scan_motifs(cfg: Config, force: bool = False):
@@ -1192,8 +1267,8 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
 
     # Merge best motif hit info onto verified markers
     motif_info = best_markers.set_index("igr_id")[
-        ["strand", "pos_10", "seq_10", "score_10", "source_10",
-         "has_ext10", "pos_35", "seq_35", "score_35", "source_35",
+        ["strand", "pos_10", "seq_10", "score_10", "pvalue_10", "source_10",
+         "has_ext10", "pos_35", "seq_35", "score_35", "pvalue_35", "source_35",
          "spacer_len", "spacer_seq", "path"]
     ].rename(columns=lambda c: f"motif_{c}")
     verified_df = verified_df.merge(motif_info, left_on="igr_id",
@@ -1455,12 +1530,14 @@ def step11_generate_report(cfg: Config, force: bool = False):
     has_motif_cols = "motif_pos_10" in promoter_df.columns
 
     # Sort rows by motif path priority (A > B > C > D > other), then
-    # within each group by a combined -10+-35 log-odds score descending,
-    # so the strongest evidence appears first. Log-odds scores are
-    # additive (log-probability-ratio), so the sum is a single
-    # comparable measure of joint -10/-35 significance. Path D rows
-    # have no -35, so they are ranked within the D group by the -10
-    # score alone.
+    # within each group by the combined empirical significance of the
+    # -10 and -35 hits, descending. We use -log10(p10) + -log10(p35)
+    # where each p-value is the fraction of 4^w k-mers that score at
+    # least as high as the observed hit under that PWM. The log-sum
+    # is equivalent to -log10(p10 * p35), the joint significance under
+    # independence, and is comparable across PWMs with differing
+    # information content. Path D rows have no -35 and are ranked
+    # within the D group by -log10(p10) alone.
     if has_motif_cols:
         def _path_rank(v):
             return {"A": 0, "B": 1, "C": 2, "D": 3}.get(str(v).strip(), 4)
@@ -1471,16 +1548,19 @@ def step11_generate_report(cfg: Config, force: bool = False):
             except (TypeError, ValueError):
                 return None
 
-        def _combined_score(row):
-            s10 = _as_float(row.get("motif_score_10"))
-            if s10 is None:
+        def _combined_neg_log10p(row):
+            p10 = _as_float(row.get("motif_pvalue_10"))
+            if p10 is None or p10 <= 0:
                 return float("-inf")
-            s35 = _as_float(row.get("motif_score_35"))
-            return s10 + s35 if s35 is not None else s10
+            val = -math.log10(p10)
+            p35 = _as_float(row.get("motif_pvalue_35"))
+            if p35 is not None and p35 > 0:
+                val += -math.log10(p35)
+            return val
 
         promoter_df = promoter_df.assign(
             _path_rank=promoter_df["motif_path"].map(_path_rank),
-            _score_key=promoter_df.apply(_combined_score, axis=1),
+            _score_key=promoter_df.apply(_combined_neg_log10p, axis=1),
         )
         promoter_df = promoter_df.sort_values(
             by=["_path_rank", "_score_key"], ascending=[True, False]
@@ -1553,7 +1633,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
         <th>Motif path</th>
         <th>&minus;10</th>
         <th>&minus;35</th>
-        <th title="Sum of -10 and -35 log-odds scores — the sort key within each path group">Combined score</th>
+        <th title="-log10(p-10) + -log10(p-35), i.e. -log10(p-10 × p-35). Higher = more significant. The within-path-group sort key.">Combined &minus;log<sub>10</sub>(p)</th>
         <th>Spacer</th>
         <th>Associated CDS</th>
         <th>Protein</th>
@@ -1645,17 +1725,23 @@ def step11_generate_report(cfg: Config, force: bool = False):
 
         spacer_cell = str(spacer_len) if spacer_len and str(spacer_len) != "." else '<span class="na">—</span>'
 
-        # Combined -10+-35 log-odds score (the within-group sort key).
-        # Path D rows have no -35 and display an em-dash.
+        # Combined -log10(p-10) + -log10(p-35) — the within-group
+        # sort key. Shows -log10(p-10) alone for Path D (no -35) so
+        # rows stay rankable within the D group.
         def _to_float(v):
             try:
                 return float(v)
             except (TypeError, ValueError):
                 return None
-        s10_f = _to_float(score_10)
-        s35_f = _to_float(score_35)
-        if s10_f is not None and s35_f is not None:
-            combined_cell = f"{s10_f + s35_f:.3f}"
+        pvalue_10 = row.get("motif_pvalue_10", "") if has_motif_cols else ""
+        pvalue_35 = row.get("motif_pvalue_35", "") if has_motif_cols else ""
+        p10_f = _to_float(pvalue_10)
+        p35_f = _to_float(pvalue_35)
+        if p10_f is not None and p10_f > 0:
+            combined_val = -math.log10(p10_f)
+            if p35_f is not None and p35_f > 0:
+                combined_val += -math.log10(p35_f)
+            combined_cell = f"{combined_val:.2f}"
         else:
             combined_cell = '<span class="na">—</span>'
 
@@ -1826,16 +1912,18 @@ def step10_final_table(cfg: Config, force: bool = False):
     product               Protein product name from Prokka GFF
     is_marker             Whether this IGR flanks a marker-operon gene
     motif_confirmed       Whether a -10/-35 motif combination was found
-    motif_path            Motif path classification (A, B, or C)
+    motif_path            Motif path classification (A, B, C, or D)
     motif_strand          Strand on which best motif hit was found
     motif_pos_10          Position of -10 element in scanned sequence
     motif_seq_10          Sequence of -10 element
-    motif_score_10        Log-odds score of -10 hit
+    motif_score_10        log2-odds score of -10 hit
+    motif_pvalue_10       Empirical p-value of -10 hit under its PWM
     motif_source_10       Subgroup ID of the best -10 hit (e.g. M001)
     motif_has_ext10       Whether extended -10 TG dinucleotide is present
     motif_pos_35          Position of -35 element
     motif_seq_35          Sequence of -35 element
-    motif_score_35        Log-odds score of -35 hit
+    motif_score_35        log2-odds score of -35 hit
+    motif_pvalue_35       Empirical p-value of -35 hit under its PWM
     motif_source_35       Subgroup ID of the best -35 hit (e.g. M001)
     motif_spacer_len      Spacer length between -35 and -10
     motif_spacer_seq      Spacer sequence
@@ -1904,8 +1992,8 @@ def step10_final_table(cfg: Config, force: bool = False):
     igr["is_marker"] = igr["igr_id"].isin(marker_igr_ids)
 
     # 6. Motif scan results (best hit per IGR from step 8)
-    motif_cols = ["strand", "pos_10", "seq_10", "score_10", "source_10",
-                  "has_ext10", "pos_35", "seq_35", "score_35", "source_35",
+    motif_cols = ["strand", "pos_10", "seq_10", "score_10", "pvalue_10", "source_10",
+                  "has_ext10", "pos_35", "seq_35", "score_35", "pvalue_35", "source_35",
                   "spacer_len", "spacer_seq", "path"]
     motif_map = {}   # igr_id -> dict of motif columns
     if cfg.motif_best_all.exists():
@@ -1927,9 +2015,10 @@ def step10_final_table(cfg: Config, force: bool = False):
         "igr_id", "contig", "start", "end", "length", "orientation",
         "associated_cds", "gene_name", "locus_tag", "product",
         "is_marker", "motif_confirmed", "motif_path", "motif_strand",
-        "motif_pos_10", "motif_seq_10", "motif_score_10", "motif_source_10",
-        "motif_has_ext10",
-        "motif_pos_35", "motif_seq_35", "motif_score_35", "motif_source_35",
+        "motif_pos_10", "motif_seq_10", "motif_score_10", "motif_pvalue_10",
+        "motif_source_10", "motif_has_ext10",
+        "motif_pos_35", "motif_seq_35", "motif_score_35", "motif_pvalue_35",
+        "motif_source_35",
         "motif_spacer_len", "motif_spacer_seq",
         "sequence_5p_to_3p",
     ]
