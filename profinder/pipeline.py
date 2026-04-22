@@ -1176,9 +1176,9 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
         return
 
     # Report threshold ranges across subgroups.
-    t10 = [thresh for _, _, thresh in m10.entries]
-    ts = [thresh for _, _, thresh in m35_strict.entries]
-    tr = [thresh for _, _, thresh in m35_relaxed.entries]
+    t10 = [e[2] for e in m10.entries]
+    ts = [e[2] for e in m35_strict.entries]
+    tr = [e[2] for e in m35_relaxed.entries]
     if t10:
         print(f"  -10 score thresholds: {min(t10):.3f} – {max(t10):.3f} "
               f"(p < {p10}, n={len(t10)} subgroups)")
