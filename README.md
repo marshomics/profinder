@@ -3,6 +3,11 @@
 <img src="pipeline.png" alt="ProFinder pipeline overview" width="100%">
 ProFinder extracts high-confidence constitutive promoter candidates from bacterial or archaeal genome assemblies. Given a FASTA file, it returns a curated shortlist of promoter sequences upstream of conserved housekeeping genes, ready for use in expression constructs, reporter systems, or metabolic engineering.
 
+
+**Access the server:**
+[ProFinder Web Interface](https://plabase.cs.uni-tuebingen.de/profinder/)
+
+
 ## How the pipeline works
 
 ProFinder applies a series of biologically motivated filters to identify promoter sequences upstream of single-copy phylogenetic marker genes that are conserved in diverse bacteria: ribosomal proteins, tRNA synthetases, DNA replication components, and similar housekeeping functions.
