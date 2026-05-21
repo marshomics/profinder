@@ -75,14 +75,25 @@ Steps
 
 Diagnostic mode
 ---------------
-    --diagnose-p-sweep replaces steps 8–11 with a p-value sweep:
-    runs steps 1–7 (reusing cached outputs), then scans the marker
-    and all-orientation IGR sets at a range of (--p10, --p35)
-    settings in three modes — matched, p10_only, p35_only — and
-    writes diagnostics/p_sweep.tsv (plus diagnostics/p_sweep.png
-    when matplotlib is available). Useful for choosing defensible
-    p-value thresholds for a given genome before committing to a
-    full run.
+    --diagnose-p-sweep replaces steps 8, 10, 11 with a p-value sweep.
+    The pipeline runs steps 1-7 and step 9 (Prokka, IGR extraction,
+    operons, HMM, marker matching, CDS annotation — all p-value
+    independent), then scans every CO_F/CO_R IGR at a range of
+    (--p10, --p35) settings in three modes — matched, p10_only,
+    p35_only — and writes:
+
+      diagnostics/p_sweep.tsv         per-sweep summary counts
+      diagnostics/p_sweep.png         3-panel figure (if matplotlib)
+      diagnostics/sweep_tables/       one profinder_results.tsv per
+                                      (mode, p10, p35), pre-filtered
+                                      to motif_confirmed = True and
+                                      motif_path in {A, B}
+
+    Each per-sweep-point table has the same column layout as the
+    canonical profinder_results.tsv produced by step 10, so it can be
+    consumed directly by downstream benchmarking (e.g. Section 5).
+    Useful for choosing defensible p-value thresholds for a given
+    genome before committing to a full run.
 """
 
 import argparse
@@ -1599,6 +1610,127 @@ def _logspace_p_values(p_min, p_max, n):
     return [10.0 ** (log_min + i * step) for i in range(n)]
 
 
+# Column layout for the per-sweep-point profinder_results.tsv. Kept in
+# lockstep with step10_final_table's output so downstream tooling
+# (e.g. Section 5 benchmarking) can ingest sweep tables identically.
+_FINAL_TABLE_COLUMNS = [
+    "igr_id", "contig", "start", "end", "length", "orientation",
+    "associated_cds", "gene_name", "locus_tag", "product",
+    "is_marker", "motif_confirmed", "motif_path", "motif_strand",
+    "motif_pos_10", "motif_seq_10", "motif_score_10", "motif_pvalue_10",
+    "motif_source_10", "motif_has_ext10",
+    "motif_pos_35", "motif_seq_35", "motif_score_35", "motif_pvalue_35",
+    "motif_source_35",
+    "motif_spacer_len", "motif_spacer_seq",
+    "sequence_5p_to_3p",
+]
+
+# The motif scan emits these per-IGR best-hit columns; they get the
+# `motif_` prefix in the final table.
+_FINAL_TABLE_MOTIF_COLS = [
+    "strand", "pos_10", "seq_10", "score_10", "pvalue_10", "source_10",
+    "has_ext10", "pos_35", "seq_35", "score_35", "pvalue_35", "source_35",
+    "spacer_len", "spacer_seq", "path",
+]
+
+
+def _assemble_final_table(igr_df, best_hits_df, marker_ids, ann_map,
+                           cds_bp=0, contigs=None):
+    """Build a step-10-equivalent ``profinder_results.tsv``-shaped
+    DataFrame from pre-loaded inputs and a per-IGR best-motif-hits
+    DataFrame.
+
+    ``igr_df`` is expected to contain ``igr_id``, ``contig``,
+    ``start``, ``end``, ``length``, ``orientation``, ``left_gene``,
+    ``right_gene``, and ``sequence`` columns (typical output of
+    ``cfg.igr_summary``). ``associated_cds`` and ``sequence_5p_to_3p``
+    are derived if absent. ``ann_map`` maps gene IDs to
+    ``{product, gene, locus_tag}`` dicts (empty dict for no annotation).
+    ``marker_ids`` is a set of IGR IDs flagged ``is_marker=True``.
+    ``best_hits_df`` is the second return value of
+    ``_scan_sequences_for_motifs`` (one row per motif-confirmed IGR),
+    or any DataFrame with at least ``igr_id`` plus the columns listed
+    in ``_FINAL_TABLE_MOTIF_COLS``. Caller is expected to filter
+    ``best_hits_df`` upstream when only a path subset (e.g.
+    ``path in {"A","B"}``) should be marked confirmed.
+
+    The function mirrors ``step10_final_table``'s column layout so
+    sweep outputs are drop-in compatible with downstream tooling that
+    reads ``profinder_results.tsv``.
+    """
+    igr = igr_df.copy()
+    if "associated_cds" not in igr.columns:
+        igr["associated_cds"] = igr.apply(_get_associated_gene, axis=1)
+    if "sequence_5p_to_3p" not in igr.columns:
+        igr["sequence_5p_to_3p"] = igr.apply(
+            lambda r: _reverse_complement(r["sequence"])
+            if r["orientation"] == "CO_R" else r["sequence"],
+            axis=1)
+
+    igr["gene_name"] = igr["associated_cds"].map(
+        lambda g: (ann_map or {}).get(g, {}).get("gene", ""))
+    igr["locus_tag"] = igr["associated_cds"].map(
+        lambda g: (ann_map or {}).get(g, {}).get("locus_tag", ""))
+    igr["product"] = igr["associated_cds"].map(
+        lambda g: (ann_map or {}).get(g, {}).get("product", ""))
+    igr["is_marker"] = (igr["igr_id"].isin(marker_ids)
+                        if marker_ids else False)
+
+    motif_map = {}
+    if best_hits_df is not None and len(best_hits_df) > 0:
+        for _, row in best_hits_df.iterrows():
+            motif_map[row["igr_id"]] = {
+                c: row.get(c, "") for c in _FINAL_TABLE_MOTIF_COLS}
+
+    igr["motif_confirmed"] = igr["igr_id"].isin(set(motif_map.keys()))
+    for c in _FINAL_TABLE_MOTIF_COLS:
+        col = f"motif_{c}"
+        igr[col] = igr["igr_id"].map(
+            lambda g, _c=c: motif_map.get(g, {}).get(_c, ""))
+
+    columns = list(_FINAL_TABLE_COLUMNS)
+    if cds_bp > 0 and contigs is not None:
+        igr = _add_cds_column(igr, contigs, cds_bp)
+        columns.append("sequence_5p_to_3p_cds")
+
+    out = igr[columns].copy()
+    out.rename(columns={"igr_id": "promoter_id"}, inplace=True)
+    return out
+
+
+def _load_annotation_map(annotations_tsv):
+    """Read ``cds_annotations.tsv`` into a {gene_id -> {gene, locus_tag,
+    product}} dict. Returns empty dict if the file is missing or empty."""
+    if not annotations_tsv.exists():
+        return {}
+    try:
+        df = pd.read_csv(annotations_tsv, sep="\t")
+    except (pd.errors.EmptyDataError, KeyError):
+        return {}
+    out = {}
+    for _, row in df.iterrows():
+        out[row["gene_id"]] = {
+            "product": str(row.get("product", "")),
+            "gene": str(row.get("gene", "")),
+            "locus_tag": str(row.get("locus_tag", "")),
+        }
+    return out
+
+
+def _sweep_table_filename(mode, p10, p35, p35_relaxed):
+    """Return a deterministic filename for a sweep-point TSV that
+    encodes mode + (p10, p35, p35_relaxed). Filename-safe and round-
+    trips through ``str.split``: e.g.
+    ``sweep_matched__p10_1.00e-03__p35_1.00e-03__p35r_2.00e-02.tsv``."""
+    return (
+        f"sweep_{mode}"
+        f"__p10_{p10:.2e}"
+        f"__p35_{p35:.2e}"
+        f"__p35r_{p35_relaxed:.2e}"
+        ".tsv"
+    )
+
+
 def _scan_counts(best_hits_df, marker_ids):
     """Summarize a best-hits DataFrame into per-path counts, both
     overall and restricted to marker-anchored IGRs."""
@@ -1691,6 +1823,8 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
         return
 
     cfg.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir = cfg.diagnostics_dir / "sweep_tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
 
     # Locate MEME file (same logic as step08)
     meme_file = cfg.meme_file
@@ -1717,6 +1851,8 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
         all_igr["sequence_5p_to_3p"] = all_igr.apply(
             lambda r: _reverse_complement(r["sequence"])
             if r["orientation"] == "CO_R" else r["sequence"], axis=1)
+    if "associated_cds" not in all_igr.columns:
+        all_igr["associated_cds"] = all_igr.apply(_get_associated_gene, axis=1)
 
     marker_ids = set()
     try:
@@ -1726,6 +1862,11 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
     except (FileNotFoundError, pd.errors.EmptyDataError):
         print("  WARNING: no marker IGR file (run step 7 first); "
               "marker counts will be 0.")
+
+    # CDS annotations + contigs are loaded once and shared across every
+    # sweep point. Both are p-value-independent.
+    ann_map = _load_annotation_map(cfg.cds_annotations)
+    contigs = (_load_contigs(cfg.input_fasta) if cfg.cds_bp > 0 else None)
 
     # Per-genome background (computed once, reused at every sweep point)
     bg_source = cfg.fna_file if cfg.fna_file.exists() else cfg.input_fasta
@@ -1741,6 +1882,10 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
     print(f"  Modes: {', '.join(modes)}")
     print(f"  p35_relaxed_ratio = {p35_relaxed_ratio} "
           f"(p35_relaxed = ratio x p35, capped at 1.0)")
+    print(f"  Per-sweep-point profinder_results.tsv files written to:")
+    print(f"    {tables_dir}/")
+    print(f"  Each table is filtered to motif_confirmed = True AND "
+          f"motif_path in {{A, B}}.")
 
     records = []
     for mode in modes:
@@ -1765,11 +1910,33 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
             elapsed = time.perf_counter() - t0
 
             counts = _scan_counts(best, marker_ids)
+
+            # Build the path-A/B-only profinder_results.tsv for this
+            # sweep point. Filtering best_hits BEFORE assembly ensures
+            # motif_confirmed = False for any IGR whose best hit was
+            # path C or D — those rows are then dropped from the table
+            # to satisfy the user's "motif_confirmed = True AND
+            # motif_path in {A, B}" requirement.
+            if best is not None and len(best) > 0 and "path" in best.columns:
+                best_ab = best[best["path"].isin({"A", "B"})].copy()
+            else:
+                best_ab = best.iloc[0:0] if best is not None else pd.DataFrame()
+            final = _assemble_final_table(
+                all_igr, best_ab, marker_ids, ann_map,
+                cds_bp=cfg.cds_bp, contigs=contigs)
+            final_filtered = final[final["motif_confirmed"]].copy()
+            sweep_table_path = (tables_dir /
+                                _sweep_table_filename(mode, p10, p35, p35_relaxed))
+            final_filtered.to_csv(sweep_table_path, sep="\t", index=False)
+
             row = {"mode": mode, "sweep_p": p,
                     "p10": p10, "p35": p35, "p35_relaxed": p35_relaxed,
                     "bg_a": bg[0], "bg_c": bg[1], "bg_g": bg[2], "bg_t": bg[3],
                     "n_igrs_scanned": len(all_igr),
-                    "elapsed_s": elapsed}
+                    "elapsed_s": elapsed,
+                    "sweep_table_path": str(sweep_table_path.relative_to(
+                        cfg.output_dir)),
+                    "n_in_sweep_table": int(len(final_filtered))}
             row.update(counts)
             records.append(row)
             print(f"    p={p:.2e}  p10={p10:.2e} p35={p35:.2e} "
@@ -1778,6 +1945,7 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
                   f"(A={counts['n_path_A']} B={counts['n_path_B']} "
                   f"C={counts['n_path_C']} D={counts['n_path_D']})  "
                   f"marker={counts['n_marker']}  "
+                  f"AB_table={len(final_filtered)}  "
                   f"{elapsed:.1f}s")
 
     sweep_df = pd.DataFrame(records)
@@ -1787,10 +1955,13 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
             "n_total", "n_path_A", "n_path_B", "n_path_C", "n_path_D",
             "n_marker", "n_marker_path_A", "n_marker_path_B",
             "n_marker_path_C", "n_marker_path_D",
+            "n_in_sweep_table", "sweep_table_path",
             "elapsed_s"]
     sweep_df = sweep_df[cols]
     sweep_df.to_csv(out_tsv, sep="\t", index=False)
-    print(f"\n  Sweep table ({len(sweep_df)} rows) -> {out_tsv}")
+    print(f"\n  Sweep summary ({len(sweep_df)} rows) -> {out_tsv}")
+    print(f"  Per-sweep-point tables ({len(sweep_df)} files) in "
+          f"{tables_dir}/")
 
     try:
         _render_p_sweep_figure(sweep_df, out_png)
@@ -2763,16 +2934,19 @@ def _run_pipeline(cfg, args):
         print("Checkpoint mode: steps with existing output will be skipped.")
         print("Use --force to re-run all steps.\n")
 
-    # Diagnostic mode: run steps 1-7 (the prerequisites — Prokka, IGR
-    # extraction, operons, HMM, marker matching) and replace steps
-    # 8-11 with the p-value sweep. Cached step outputs are reused, so
-    # multiple --diagnose-p-sweep runs against the same genome with
-    # different sweep windows reuse Prokka / hmmsearch.
+    # Diagnostic mode: run the p-value-independent prerequisites
+    # (Prokka, IGR extraction, operons, HMM, marker matching, CDS
+    # annotation — steps 1-7 plus 9), skip the default-threshold motif
+    # scan (step 8), and replace steps 10-11 with the p-value sweep.
+    # Step 9 is included because the per-sweep-point profinder_results.tsv
+    # files carry gene_name / locus_tag / product columns, which are
+    # p-value-independent and worth computing once. Cached outputs from
+    # any prior run (full or diagnostic) are reused.
     if getattr(args, "diagnose_p_sweep", False):
-        DIAGNOSTIC_PREREQS = 7
+        DIAGNOSTIC_PREREQ_STEPS = {1, 2, 3, 4, 5, 6, 7, 9}
         for num, name, func in STEPS:
-            if num > DIAGNOSTIC_PREREQS:
-                break
+            if num not in DIAGNOSTIC_PREREQ_STEPS:
+                continue
             if args.start <= num <= args.end:
                 print(f"\n{'=' * 60}")
                 print(f"  STEP {num}: {name}")
