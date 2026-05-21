@@ -9,17 +9,34 @@ and outputs promoter sequences in 5'-to-3' orientation.
 Use ``--domain bacteria`` (default) or ``--domain archaea``.
 Promoter verification is performed by scanning for -10/-35 hexamer
 motifs using position weight matrices from the bundled
-``all_unique_subgroups.meme`` file. Paths A–C require a -35 hit with
-a 15–19 bp spacer to the -10 hit; Path D requires only an extended
--10. Each -10 hit is classified as Path A (linked strict -35, same
-subgroup), Path B (extended -10 with a linked relaxed -35, same
-subgroup), Path C (unlinked strict -35, different subgroup), or Path
-D (extended -10 with no -35 in the spacer window). Anything else is
-no hit. Within each path group, rows are ranked by the combined
-empirical significance -log10(p10) + -log10(p35), where each p-value
-is the fraction of 4^w k-mers scoring at least as high under that
-subgroup's PWM — a per-PWM measure that is comparable across
-subgroups with differing information content.
+``all_unique_subgroups.meme`` file. PWM log-odds, score thresholds,
+and empirical p-values are all calibrated against per-genome A/C/G/T
+frequencies derived from the input FASTA, so significance reflects
+the composition of the genome being scanned rather than a fixed
+uniform background. Before scoring, a low-complexity mask is computed
+over each strand and 6-mer anchor positions inside masked tracts
+(simple repeats, homopolymers, strongly biased composition) are
+skipped, so the AT-rich -10 PWM does not pile up spurious hits in
+poly-A runs. The motif scan is also orientation-aware: tandem-
+cooriented IGRs (CO_F, CO_R) are scanned on the ``+`` strand of the
+already-oriented ``sequence_5p_to_3p`` only, because a ``-`` strand
+motif on such an IGR would describe a promoter pointing away from
+the downstream marker gene; divergent IGRs (DP) are scanned on both
+strands since each strand carries the promoter for one of the two
+flanking genes. When multiple subgroups exceed threshold at the same
+position, the most-significant one (lowest empirical p-value under
+the per-genome background) is reported, with raw log-odds as the
+tiebreaker. Paths A–C require a -35 hit with a 15–19 bp spacer to the
+-10 hit; Path D requires only an extended -10. Each -10 hit is
+classified as Path A (linked strict -35, same subgroup), Path B
+(extended -10 with a linked relaxed -35, same subgroup), Path C
+(unlinked strict -35, different subgroups), or Path D (extended -10
+with no -35 in the spacer window). The extended -10 anchor accepts
+"TG" at either of the two literature-reported positions immediately
+upstream of the -10 hexamer (-2/-1 or -3/-2 of the motif, equivalent
+to TSS positions -14/-13 and -15/-14 for a -10 anchored at the
+textbook -12 to -7). Anything else is no hit. Within each path group,
+rows are ranked by combined significance -log10(p10) + -log10(p35).
 
 Usage
 -----
@@ -55,6 +72,17 @@ Steps
     9.  Annotate associated CDS (Prokka product names, gene, locus tag)
     10. Build final output table (all promoters, all metadata)
     11. Generate HTML report
+
+Diagnostic mode
+---------------
+    --diagnose-p-sweep replaces steps 8–11 with a p-value sweep:
+    runs steps 1–7 (reusing cached outputs), then scans the marker
+    and all-orientation IGR sets at a range of (--p10, --p35)
+    settings in three modes — matched, p10_only, p35_only — and
+    writes diagnostics/p_sweep.tsv (plus diagnostics/p_sweep.png
+    when matplotlib is available). Useful for choosing defensible
+    p-value thresholds for a given genome before committing to a
+    full run.
 """
 
 import argparse
@@ -139,51 +167,177 @@ def _parse_meme_file(filepath):
     return motifs
 
 
-def _freq_to_log_odds(freq_matrix, bg=0.25, pseudocount=1e-6):
-    """Convert frequency matrix to log2-odds scoring matrix."""
-    return [[math.log2(max(f, pseudocount) / bg) for f in row]
+_UNIFORM_BG = (0.25, 0.25, 0.25, 0.25)
+
+
+def _compute_background_from_fasta(fasta_path):
+    """Compute genome-wide A/C/G/T frequencies from a FASTA.
+
+    Returns a 4-tuple ``(p_A, p_C, p_G, p_T)`` summed across all contigs,
+    case-insensitive, ignoring ambiguous bases (N, IUPAC codes) and any
+    non-letter characters. Falls back to uniform 0.25 if the FASTA is
+    empty or unreadable. Used to calibrate PWM log-odds and the
+    enumeration of k-mer probabilities for threshold / p-value lookup,
+    per the comment in ``all_unique_subgroups.meme`` that "Per-organism
+    A/C/G/T frequencies used in the scan are in per_organism_background.tsv".
+    """
+    counts = {"A": 0, "C": 0, "G": 0, "T": 0}
+    try:
+        with _open_maybe_gzip(fasta_path) as fh:
+            for rec in SeqIO.parse(fh, "fasta"):
+                s = str(rec.seq).upper()
+                for b in "ACGT":
+                    counts[b] += s.count(b)
+    except Exception:
+        return _UNIFORM_BG
+    total = sum(counts.values())
+    if total == 0:
+        return _UNIFORM_BG
+    return (counts["A"] / total, counts["C"] / total,
+            counts["G"] / total, counts["T"] / total)
+
+
+def _compute_low_complexity_mask(seq, window=12, min_entropy=1.4):
+    """Return a list[bool] of length ``len(seq)`` marking motif-anchor
+    positions whose surrounding context is low-complexity.
+
+    For each position ``i``, the Shannon entropy of single-nucleotide
+    frequencies is computed over a window of ``window`` bp centered on
+    ``i`` (clipped at sequence boundaries). Positions with entropy
+    below ``min_entropy`` bits are masked. Maximum entropy for a
+    four-letter alphabet is 2.0 bits; homopolymers give 0.0, simple
+    dinucleotide repeats give ~1.0, AT-only or GC-only tracts give
+    ≤ 1.0, and well-mixed sequence typically exceeds 1.6 in a 12 bp
+    window. The default cutoff of 1.4 catches homopolymers, simple
+    repeats, and strongly biased tracts while leaving normal IGR
+    composition untouched.
+
+    Low-complexity masking before PWM scanning is standard practice
+    (Wootton & Federhen, 1996; Morgulis et al., 2006); ProFinder
+    previously applied no masking, leaving the -10 PWM (AT-rich
+    consensus) prone to spurious calls inside poly-A and AT-repeat
+    tracts common in bacterial IGRs.
+    """
+    n = len(seq)
+    if n == 0:
+        return []
+    masked = [False] * n
+    half = window // 2
+    extra = window - half  # window may be odd
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + extra)
+        win = seq[lo:hi]
+        if len(win) < 4:
+            masked[i] = True
+            continue
+        counts = {}
+        for b in win:
+            counts[b] = counts.get(b, 0) + 1
+        total = len(win)
+        ent = 0.0
+        for c in counts.values():
+            p = c / total
+            ent -= p * math.log2(p)
+        if ent < min_entropy:
+            masked[i] = True
+    return masked
+
+
+def _freq_to_log_odds(freq_matrix, bg=_UNIFORM_BG, pseudocount=1e-6):
+    """Convert a frequency matrix to log2-odds against ``bg``.
+
+    ``bg`` is a 4-tuple (p_A, p_C, p_G, p_T). The pseudocount only
+    matters when the input frequency is exact zero; the bundled
+    ``all_unique_subgroups.meme`` has no zeros so it does not fire in
+    practice. The same ``bg`` is reused by ``_enumerate_pwm_table`` to
+    build the k-mer probability distribution against which thresholds
+    and p-values are calibrated, so log-odds and significance share
+    one background.
+    """
+    return [[math.log2(max(f, pseudocount) / max(bg[b], 1e-12))
+             for b, f in enumerate(row)]
             for row in freq_matrix]
 
 
-def _enumerate_pwm_scores(log_odds_matrix):
-    """Return the ascending-sorted array of all 4^w possible k-mer scores
-    under this PWM (uniform 0.25 background). Enables both threshold
-    lookup and empirical p-value lookup via binary search."""
+def _enumerate_pwm_table(log_odds_matrix, bg=_UNIFORM_BG):
+    """Enumerate all 4^w k-mer scores under this PWM, return arrays
+    suitable for background-aware threshold and p-value lookup.
+
+    Returns ``(sorted_scores, cum_above)`` where ``sorted_scores`` is
+    a list of all 4^w log-odds scores in ascending order and
+    ``cum_above[i]`` is the cumulative probability — under ``bg`` — of
+    a random k-mer scoring at least ``sorted_scores[i]``. By
+    construction ``cum_above[0] == 1.0`` and ``cum_above[n] == 0.0``.
+    With uniform background each k-mer contributes 1/4^w and this
+    reduces to the prior count-based formulation; with non-uniform
+    background, common k-mers (e.g. AT-rich hexamers in AT-rich
+    genomes) carry more weight and the threshold for a given p-value
+    is appropriately tightened.
+    """
     w = len(log_odds_matrix)
-    scores = [sum(log_odds_matrix[i][b] for i, b in enumerate(kmer))
-              for kmer in iprod(range(4), repeat=w)]
-    scores.sort()  # ascending
-    return scores
+    pairs = []
+    for kmer in iprod(range(4), repeat=w):
+        score = sum(log_odds_matrix[i][b] for i, b in enumerate(kmer))
+        prob = 1.0
+        for b in kmer:
+            prob *= bg[b]
+        pairs.append((score, prob))
+    pairs.sort(key=lambda x: x[0])
+    n = len(pairs)
+    sorted_scores = [p[0] for p in pairs]
+    cum_above = [0.0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        cum_above[i] = cum_above[i + 1] + pairs[i][1]
+    return sorted_scores, cum_above
 
 
-def _threshold_from_sorted_scores(sorted_scores_asc, p_value):
-    """Score threshold such that approximately ``p_value`` fraction of
-    k-mers score ≥ threshold. Uses the ceiling so the realised
-    false-positive rate is at most slightly above the target."""
-    n = len(sorted_scores_asc)
-    k = max(1, min(int(math.ceil(p_value * n)), n))
-    return sorted_scores_asc[n - k]
+def _threshold_from_table(sorted_scores, cum_above, p_value):
+    """Smallest score ``s`` such that P(random k-mer scores ≥ s | bg)
+    is ≤ ``p_value``. Realised false-positive rate is therefore at
+    most ``p_value``. If even the highest-scoring k-mer alone exceeds
+    ``p_value`` (i.e. ``cum_above[n-1] > p_value``), returns a score
+    one log-odds unit above the maximum (effectively unreachable).
+    """
+    n = len(sorted_scores)
+    if n == 0:
+        return float("inf")
+    # cum_above[i] is monotonically decreasing in i. Find smallest i with
+    # cum_above[i] <= p_value via binary search.
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cum_above[mid] > p_value:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo >= n:
+        return sorted_scores[-1] + 1.0
+    return sorted_scores[lo]
 
 
-def _pvalue_from_sorted_scores(sorted_scores_asc, score):
-    """Empirical p-value for ``score`` under this PWM: fraction of all
-    4^w k-mers that score at least ``score``. Returns 1/n for scores
-    higher than every enumerated k-mer (floor for ``-log10(p)``)."""
-    n = len(sorted_scores_asc)
-    idx = bisect.bisect_left(sorted_scores_asc, score)
-    n_ge = n - idx
-    if n_ge <= 0:
-        return 1.0 / n
-    return n_ge / n
+def _pvalue_from_table(sorted_scores, cum_above, score):
+    """Empirical p-value for ``score`` under the background:
+    P(random k-mer scores ≥ score). For scores above every enumerated
+    k-mer's score, returns the smallest single-k-mer probability in
+    the table (the natural floor — that floor equals ``cum_above[n-1]``,
+    the probability of the single highest-scoring k-mer)."""
+    n = len(sorted_scores)
+    if n == 0:
+        return 1.0
+    idx = bisect.bisect_left(sorted_scores, score)
+    if idx >= n:
+        return cum_above[n - 1]
+    return cum_above[idx]
 
 
-def _compute_score_threshold(log_odds_matrix, p_value):
-    """Backwards-compatible wrapper: enumerate, then threshold. Prefer
-    enumerating once and calling the helpers above directly when the
-    sorted array will be reused (see ``_MotifSet``)."""
-    return _threshold_from_sorted_scores(
-        _enumerate_pwm_scores(log_odds_matrix), p_value
-    )
+def _compute_score_threshold(log_odds_matrix, p_value, bg=_UNIFORM_BG):
+    """Backwards-compatible wrapper: enumerate against ``bg``, then
+    threshold. ``bg`` defaults to uniform 0.25 so existing callers
+    still get the previous behaviour. Prefer enumerating once and
+    reusing the table when running many lookups."""
+    sorted_scores, cum_above = _enumerate_pwm_table(log_odds_matrix, bg)
+    return _threshold_from_table(sorted_scores, cum_above, p_value)
 
 
 def _score_kmer(seq, pos, log_odds_matrix):
@@ -199,67 +353,79 @@ def _score_kmer(seq, pos, log_odds_matrix):
 
 class _MotifSet:
     """A collection of subgroup motifs for one element type (-10 or -35),
-    each with its own log-odds matrix and score threshold. Subgroup IDs
+    each with its own log-odds matrix, background-aware score threshold,
+    and cumulative-probability table for p-value lookup. Subgroup IDs
     (e.g. ``M001``) are used to test for "linked" hits where a -10 and
     a -35 come from the same subgroup."""
 
-    def __init__(self):
-        # list of (subgroup, log_odds_matrix, threshold, sorted_scores_asc)
+    def __init__(self, bg=_UNIFORM_BG):
+        # list of (subgroup, log_odds_matrix, threshold, sorted_scores, cum_above)
         self.entries = []
+        self.bg = bg
 
     def add(self, subgroup, freq_matrix, p_value):
-        lom = _freq_to_log_odds(freq_matrix)
-        sorted_scores = _enumerate_pwm_scores(lom)
-        thresh = _threshold_from_sorted_scores(sorted_scores, p_value)
-        self.entries.append((subgroup, lom, thresh, sorted_scores))
+        lom = _freq_to_log_odds(freq_matrix, self.bg)
+        sorted_scores, cum_above = _enumerate_pwm_table(lom, self.bg)
+        thresh = _threshold_from_table(sorted_scores, cum_above, p_value)
+        self.entries.append((subgroup, lom, thresh, sorted_scores, cum_above))
 
     def best_hit(self, seq, pos):
-        """Return (score, subgroup, pvalue) of the best-scoring motif
-        that exceeds its threshold at this position, or None. The
-        p-value is empirical — the fraction of 4^w k-mers for that
-        subgroup's PWM scoring at least this high — and is therefore
-        comparable across PWMs with differing information content."""
+        """Return (score, subgroup, pvalue) of the most-significant
+        motif (lowest empirical p-value) that exceeds its threshold at
+        this position, or None. Tie-break by higher raw score.
+
+        Empirical p-values are computed under the same background
+        ``self.bg`` that calibrated each PWM's threshold, so they are
+        comparable across subgroups of differing information content
+        and are the principled selection criterion. (Raw log-odds are
+        not cross-subgroup comparable: a sharp PWM yields higher
+        maxima than a flat PWM for the same biological motif.)
+        """
+        best_pv = None
         best = None
-        best_scores_arr = None
-        for subgroup, lom, thresh, sorted_scores in self.entries:
+        for subgroup, lom, thresh, sorted_scores, cum_above in self.entries:
             s = _score_kmer(seq, pos, lom)
-            if s is not None and s >= thresh:
-                if best is None or s > best[0]:
-                    best = (s, subgroup)
-                    best_scores_arr = sorted_scores
-        if best is None:
-            return None
-        pv = _pvalue_from_sorted_scores(best_scores_arr, best[0])
-        return (best[0], best[1], pv)
+            if s is None or s < thresh:
+                continue
+            pv = _pvalue_from_table(sorted_scores, cum_above, s)
+            if best_pv is None or pv < best_pv or (pv == best_pv and s > best[0]):
+                best_pv = pv
+                best = (s, subgroup, pv)
+        return best
 
     def hit_for_subgroup(self, seq, pos, subgroup):
         """Return (score, pvalue) for a specific subgroup's motif at
         this position if it exceeds that subgroup's threshold, else
-        None."""
-        for sub, lom, thresh, sorted_scores in self.entries:
+        None. Subgroups are unique per MotifSet so the loop terminates
+        once a match is found."""
+        for sub, lom, thresh, sorted_scores, cum_above in self.entries:
             if sub != subgroup:
                 continue
             s = _score_kmer(seq, pos, lom)
             if s is not None and s >= thresh:
-                pv = _pvalue_from_sorted_scores(sorted_scores, s)
+                pv = _pvalue_from_table(sorted_scores, cum_above, s)
                 return (s, pv)
             return None
         return None
 
 
-def _load_motifs_from_file(meme_path, p10, p35_strict, p35_relaxed):
-    """Load paired subgroup motifs from a single MEME file.
+def _load_motifs_from_file(meme_path, p10, p35_strict, p35_relaxed,
+                            bg=_UNIFORM_BG):
+    """Load paired subgroup motifs from a single MEME file, calibrated
+    against the supplied background ``bg`` (4-tuple of A/C/G/T
+    frequencies).
 
     Expects motifs named ``<subgroup>_m10`` and ``<subgroup>_m35`` —
     e.g. ``M001_m10`` / ``M001_m35``. Returns
     ``(m10, m35_strict, m35_relaxed)`` MotifSets where each entry's
     source is the subgroup ID. The strict and relaxed -35 sets hold
     the same PWMs but with different score thresholds: strict is used
-    for Path A and Path C, relaxed for Path B.
+    for Path A and Path C, relaxed for Path B. All three sets are
+    calibrated against the same ``bg``.
     """
-    m10 = _MotifSet()
-    m35_strict = _MotifSet()
-    m35_relaxed = _MotifSet()
+    m10 = _MotifSet(bg=bg)
+    m35_strict = _MotifSet(bg=bg)
+    m35_relaxed = _MotifSet(bg=bg)
 
     meme_path = Path(meme_path)
     if not meme_path.is_file():
@@ -289,12 +455,23 @@ def _load_motifs_from_file(meme_path, p10, p35_strict, p35_relaxed):
 def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     """Scan one strand for promoter candidates. Returns a list of result dicts.
 
+    Before scoring, a low-complexity mask is computed over the strand
+    (see ``_compute_low_complexity_mask``). Both -10 and -35 PWM
+    lookups skip masked positions, so that AT-rich repeat tracts
+    (which the -10 PWM is otherwise prone to call) do not contribute
+    spurious hits.
+
     Each -10 hit is classified into one of four paths, in priority
     order. Paths A–C require a -35 hit with a 15–19 bp spacer; Path D
     requires only an extended -10:
 
         A  Linked -10 and strict -35 (same subgroup).
-        B  Extended -10 (TG at -2/-1) plus a linked relaxed -35 (same subgroup).
+        B  Extended -10 ("TG" immediately upstream — at -2/-1 OR
+           -3/-2 of the -10 hexamer) plus a linked relaxed -35 (same
+           subgroup). Both anchor positions are accepted because the
+           literature places extended -10 at either -15/-14 (canonical;
+           "TG" at -3/-2 of a -10 anchored at -12 to -7) or
+           -14/-13 (slipped; "TG" at -2/-1).
         C  Unlinked -10 and strict -35 (different subgroups).
         D  Extended -10 with no -35 in the 15–19 bp window.
 
@@ -303,9 +480,20 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     w = _MOTIF_WIDTH
     max_pos = len(seq) - w
 
+    # Per-position low-complexity mask. Both PWM scans consult this
+    # mask before scoring, so masked anchor positions contribute
+    # nothing to either the -10 hit list or the strict-by-pos -35
+    # index. Skipping at the anchor is equivalent to masking the
+    # entire 6-mer because the 6-mer extends from the anchor for
+    # six bases — anchors inside a low-complexity tract describe
+    # 6-mers that lie within that tract.
+    mask = _compute_low_complexity_mask(seq)
+
     # Pre-scan all -10 hits
     hits_10 = []
     for i in range(max_pos + 1):
+        if i < len(mask) and mask[i]:
+            continue
         hit = m10.best_hit(seq, i)
         if hit:
             # hit = (score, subgroup, pvalue)
@@ -320,13 +508,22 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     # the -10 hit.
     strict_by_pos = {}
     for i in range(max_pos + 1):
+        if i < len(mask) and mask[i]:
+            continue
         hit_s = m35_strict.best_hit(seq, i)
         if hit_s:
             strict_by_pos[i] = hit_s  # (score, subgroup, pvalue)
 
     results = []
     for pos_10, score_10, subgroup_10, pvalue_10 in hits_10:
-        has_ext10 = pos_10 >= 2 and seq[pos_10 - 2:pos_10] == "TG"
+        # Accept "TG" at either of the two literature-reported anchor
+        # positions for the extended -10. Both forms are documented in
+        # the σ⁷⁰ literature; requiring exactly one anchor was
+        # over-restrictive and excluded the canonical -15/-14 form
+        # when the -10 hexamer is anchored at the textbook -12 to -7.
+        ext10_at_m2 = pos_10 >= 2 and seq[pos_10 - 2:pos_10] == "TG"
+        ext10_at_m3 = pos_10 >= 3 and seq[pos_10 - 3:pos_10 - 1] == "TG"
+        has_ext10 = ext10_at_m2 or ext10_at_m3
 
         # Walk the 15–19 bp spacer window once, tracking:
         #   best_linked_strict   — same subgroup, strict threshold (Path A)
@@ -429,10 +626,48 @@ def _neg_log10_p_combined(r):
 _PATH_RANK = {"A": 0, "B": 1, "C": 2, "D": 3}
 
 
+def _strands_for_orientation(orientation):
+    """Which strand(s) of ``sequence_5p_to_3p`` can carry a real
+    promoter for the IGR's downstream gene, given the PIGGY orientation
+    label.
+
+    The IGR has already been oriented 5'→3' relative to its associated
+    downstream gene in step 2 (CO_R reverse-complemented; CO_F, DP,
+    CONV kept on the + strand of the assembly). For tandem-cooriented
+    IGRs (CO_F, CO_R), the downstream gene's promoter can only sit on
+    the ``+`` strand of the oriented sequence — a ``-`` strand motif
+    would describe a promoter pointing away from the marker, into a
+    flanking gene that does not exist on that strand. For divergent
+    IGRs (DP), each strand carries the promoter for one of the two
+    diverging genes, so both strands are biologically meaningful.
+    For convergent IGRs (CONV) there is no associated downstream
+    promoter at all; we scan ``+`` only to mirror the CO_F default
+    rather than double the work.
+
+    Returns a list of strand labels to scan. Unknown / missing
+    orientations fall back to both strands (preserves the original
+    behavior for callers that don't supply orientation).
+    """
+    if orientation in ("CO_F", "CO_R", "CONV"):
+        return ["+"]
+    if orientation == "DP":
+        return ["+", "-"]
+    return ["+", "-"]
+
+
 def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
                                seq_col="sequence_5p_to_3p",
-                               id_col="igr_id"):
+                               id_col="igr_id",
+                               orientation_col="orientation"):
     """Scan a DataFrame of sequences for -10/-35 promoter motifs.
+
+    Strand selection is orientation-aware: see
+    ``_strands_for_orientation``. For the manuscript's tandem-cooriented
+    IGRs (CO_F / CO_R), only the ``+`` strand of the already-oriented
+    ``sequence_5p_to_3p`` is scanned, because a ``-`` strand motif
+    describes a promoter that cannot transcribe the IGR's downstream
+    marker gene. If ``orientation_col`` is absent from ``df``, both
+    strands are scanned (legacy behavior).
 
     Returns two DataFrames:
         all_hits  — every motif hit found (multiple rows per sequence possible)
@@ -446,6 +681,8 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
     # -log10(p) is more significant, so we negate for min-comparison.
     best_per_seq = {}
 
+    has_orientation = orientation_col in df.columns
+
     for _, row in df.iterrows():
         raw = row[seq_col]
         if not isinstance(raw, str) or not raw:
@@ -453,7 +690,12 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
         raw = raw.upper()
         igr_id = row[id_col]
 
-        for strand, seq in [("+", raw), ("-", _revcomp_simple(raw))]:
+        orientation = row[orientation_col] if has_orientation else None
+        strands_to_scan = _strands_for_orientation(orientation)
+        strand_pairs = [(s, raw if s == "+" else _revcomp_simple(raw))
+                        for s in strands_to_scan]
+
+        for strand, seq in strand_pairs:
             for r in _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
                 out = {id_col: igr_id, "strand": strand}
                 for k in _MOTIF_COLUMNS:
@@ -1171,14 +1413,29 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
             print("  Step 8 complete.\n")
             return
 
+    # Compute per-genome A/C/G/T background. The bundled MEME file's
+    # header explicitly notes that "Per-organism A/C/G/T frequencies
+    # used in the scan are in per_organism_background.tsv" — that file
+    # is not shipped, so we derive the background directly from the
+    # input genome (Prokka .fna when available, otherwise the original
+    # input). PWM log-odds and the 4^w k-mer enumeration used for
+    # threshold / p-value lookup are calibrated against this same
+    # background, so significance is internally consistent with the
+    # composition of the genome being scanned.
+    bg_source = cfg.fna_file if cfg.fna_file.exists() else cfg.input_fasta
+    bg = _compute_background_from_fasta(bg_source)
+
     # Load paired subgroup motifs
     p10 = cfg.motif_p10
     p35 = cfg.motif_p35
     p35_relaxed = cfg.motif_p35_relaxed
     print(f"── Loading motifs from {Path(meme_file).name} "
           f"(p10={p10}, p35={p35}, p35_relaxed={p35_relaxed}) ──")
+    print(f"  Background ({Path(bg_source).name}): "
+          f"A={bg[0]:.3f} C={bg[1]:.3f} G={bg[2]:.3f} T={bg[3]:.3f} "
+          f"(GC={bg[1] + bg[2]:.3f})")
     m10, m35_strict, m35_relaxed = _load_motifs_from_file(
-        meme_file, p10, p35, p35_relaxed)
+        meme_file, p10, p35, p35_relaxed, bg=bg)
 
     if not m10.entries:
         print("  No -10 motifs loaded — cannot scan.")
@@ -1223,7 +1480,8 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
         axis=1,
     )
 
-    print(f"\n  Scanning {len(all_igr)} promoter-orientation IGRs...")
+    print(f"\n  Scanning {len(all_igr)} promoter-orientation IGRs "
+          f"(orientation-aware: + strand only for CO_F/CO_R)...")
     all_hits, best_all = _scan_sequences_for_motifs(
         all_igr, m10, m35_strict, m35_relaxed)
 
@@ -1265,7 +1523,8 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
             axis=1,
         )
 
-    print(f"\n  Scanning {len(markers_df)} marker promoters...")
+    print(f"\n  Scanning {len(markers_df)} marker promoters "
+          f"(orientation-aware: + strand only for CO_F/CO_R)...")
     marker_hits, best_markers = _scan_sequences_for_motifs(
         markers_df, m10, m35_strict, m35_relaxed)
 
@@ -1296,6 +1555,249 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
     _write_fasta(verified_df, cfg.marker_promoters_verified_fasta, short_header=False)
 
     print("  Step 8 complete.\n")
+
+
+# =====================================================================
+#  Diagnostic — sweep -10 / -35 PWM p-value thresholds
+# =====================================================================
+#
+# Why a sweep: choosing motif_p10 and motif_p35 is consequential — the
+# benchmark variants in the manuscript (AB / ABC / lowerps / samep /
+# lower35) all differ only in these two (or three, including
+# p35_relaxed) numbers, and produce yield differences spanning an
+# order of magnitude. The defensible answer to "what should p10 / p35
+# be?" depends on the genome and on what the user values (precision
+# vs recall, path-A purity vs path-B/C recovery). This module records
+# what the pipeline would have output at a wide range of (p10, p35)
+# settings without re-running Prokka, hmmsearch, or operon ID.
+#
+# Three sweep modes, run by default:
+#   matched   — set p10 = p35 = p for each swept value p
+#   p10_only  — vary p10 across the swept values, hold p35 at the
+#               cfg default (or whatever the run was launched with)
+#   p35_only  — vary p35 across the swept values, hold p10 at the
+#               cfg default
+#
+# In every mode the relaxed -35 threshold (used only for Path B) is
+# pinned to `p35 * p35_relaxed_ratio` (default ratio 20, matching the
+# pipeline's default 2.5e-3 strict / 5e-2 relaxed). Capped at 1.0 so
+# extreme sweep points don't blow past valid probability.
+#
+# All sweep points share the per-genome A/C/G/T background, computed
+# once and passed in, so the comparison across sweep points is
+# internally consistent.
+# =====================================================================
+
+def _logspace_p_values(p_min, p_max, n):
+    """Return `n` p-values log-spaced inclusive of both endpoints. For
+    `n == 1`, returns just `p_max`."""
+    if n <= 1:
+        return [p_max]
+    log_min = math.log10(p_min)
+    log_max = math.log10(p_max)
+    step = (log_max - log_min) / (n - 1)
+    return [10.0 ** (log_min + i * step) for i in range(n)]
+
+
+def _scan_counts(best_hits_df, marker_ids):
+    """Summarize a best-hits DataFrame into per-path counts, both
+    overall and restricted to marker-anchored IGRs."""
+    out = {"n_total": 0, "n_path_A": 0, "n_path_B": 0,
+           "n_path_C": 0, "n_path_D": 0,
+           "n_marker": 0, "n_marker_path_A": 0, "n_marker_path_B": 0,
+           "n_marker_path_C": 0, "n_marker_path_D": 0}
+    if best_hits_df is None or len(best_hits_df) == 0:
+        return out
+    out["n_total"] = len(best_hits_df)
+    path_counts = best_hits_df["path"].value_counts().to_dict()
+    for k in ("A", "B", "C", "D"):
+        out[f"n_path_{k}"] = int(path_counts.get(k, 0))
+    if marker_ids:
+        marker_mask = best_hits_df["igr_id"].isin(marker_ids)
+        marker_df = best_hits_df[marker_mask]
+        out["n_marker"] = int(len(marker_df))
+        mpath = marker_df["path"].value_counts().to_dict()
+        for k in ("A", "B", "C", "D"):
+            out[f"n_marker_path_{k}"] = int(mpath.get(k, 0))
+    return out
+
+
+def _render_p_sweep_figure(sweep_df, out_path):
+    """Optional 3-panel figure: one subplot per mode, x = swept p,
+    y = stacked counts of marker-anchored hits by path (A / B / C / D).
+    Returns False (and skips) if matplotlib is not available."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"  matplotlib unavailable ({e}); skipping figure")
+        return False
+
+    modes = list(sweep_df["mode"].drop_duplicates())
+    n_modes = len(modes)
+    fig, axes = plt.subplots(1, max(1, n_modes),
+                              figsize=(4.2 * max(1, n_modes), 3.5),
+                              sharey=True, squeeze=False)
+    axes = axes[0]
+    path_colors = {"A": "#2e7d32", "B": "#e65100",
+                    "C": "#c62828", "D": "#546e7a"}
+    for ax, mode in zip(axes, modes):
+        sub = sweep_df[sweep_df["mode"] == mode].sort_values("sweep_p")
+        if len(sub) == 0:
+            ax.set_title(f"{mode} (no data)")
+            continue
+        x = sub["sweep_p"].values
+        bottom = [0] * len(sub)
+        for path in ("A", "B", "C", "D"):
+            y = sub[f"n_marker_path_{path}"].values
+            ax.bar(range(len(sub)), y, bottom=bottom,
+                   color=path_colors[path], label=f"path {path}",
+                   width=0.85, edgecolor="white", linewidth=0.5)
+            bottom = [b + v for b, v in zip(bottom, y)]
+        ax.set_xticks(range(len(sub)))
+        ax.set_xticklabels([f"{p:.1e}" for p in x],
+                            rotation=45, ha="right", fontsize=7)
+        ax.set_title(mode, fontsize=10)
+        ax.set_xlabel("swept p-value")
+        ax.set_xscale("linear")
+    axes[0].set_ylabel("marker-anchored hits (count)")
+    axes[-1].legend(loc="upper right", fontsize=8, framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  Figure -> {out_path}")
+    return True
+
+
+def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
+                      sweep_n=13, modes=("matched", "p10_only", "p35_only"),
+                      p35_relaxed_ratio=20.0, force: bool = False):
+    """Sweep -10 / -35 PWM p-value thresholds and record per-path
+    promoter counts at each sweep point. Reuses cached outputs from
+    steps 2 (igr_summary.tsv) and 7 (promoter_markers.tsv). Writes
+    ``diagnostics/p_sweep.tsv`` and, when matplotlib is available,
+    ``diagnostics/p_sweep.png``. Each sweep point reuses the same
+    per-genome A/C/G/T background; only the score thresholds change.
+    Outputs are deterministic for the same inputs and CLI flags."""
+    import time
+
+    out_tsv = cfg.diagnostics_dir / "p_sweep.tsv"
+    out_png = cfg.diagnostics_dir / "p_sweep.png"
+    if out_tsv.exists() and not force:
+        print(f"── p-value sweep diagnostic already exists, skipping ──")
+        print(f"  -> {out_tsv}")
+        print("  Diagnostic complete.\n")
+        return
+
+    cfg.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+
+    # Locate MEME file (same logic as step08)
+    meme_file = cfg.meme_file
+    if meme_file is None or not Path(meme_file).is_file():
+        bundled = Path(__file__).parent / "all_unique_subgroups.meme"
+        if bundled.is_file():
+            meme_file = bundled
+        else:
+            print("── No MEME file found, skipping p-sweep diagnostic ──")
+            return
+
+    # Load inputs once
+    try:
+        all_igr = pd.read_csv(cfg.igr_summary, sep="\t")
+        all_igr = all_igr[all_igr["orientation"].isin(["CO_F", "CO_R"])].copy()
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        all_igr = pd.DataFrame()
+    if all_igr.empty:
+        print("── No promoter-orientation IGRs to scan; "
+              "run steps 1-2 first ──")
+        return
+
+    if "sequence_5p_to_3p" not in all_igr.columns:
+        all_igr["sequence_5p_to_3p"] = all_igr.apply(
+            lambda r: _reverse_complement(r["sequence"])
+            if r["orientation"] == "CO_R" else r["sequence"], axis=1)
+
+    marker_ids = set()
+    try:
+        mdf = pd.read_csv(cfg.promoter_markers, sep="\t")
+        mdf = mdf[mdf["orientation"].isin(["CO_F", "CO_R"])]
+        marker_ids = set(mdf["igr_id"])
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        print("  WARNING: no marker IGR file (run step 7 first); "
+              "marker counts will be 0.")
+
+    # Per-genome background (computed once, reused at every sweep point)
+    bg_source = cfg.fna_file if cfg.fna_file.exists() else cfg.input_fasta
+    bg = _compute_background_from_fasta(bg_source)
+
+    sweep_ps = _logspace_p_values(sweep_min, sweep_max, sweep_n)
+    print(f"── p-value sweep diagnostic ──")
+    print(f"  IGRs to scan: {len(all_igr)}  (markers: {len(marker_ids)})")
+    print(f"  Background ({Path(bg_source).name}): "
+          f"A={bg[0]:.3f} C={bg[1]:.3f} G={bg[2]:.3f} T={bg[3]:.3f}")
+    print(f"  Sweep: {sweep_n} log-spaced points in "
+          f"[{sweep_min:.1e}, {sweep_max:.1e}]")
+    print(f"  Modes: {', '.join(modes)}")
+    print(f"  p35_relaxed_ratio = {p35_relaxed_ratio} "
+          f"(p35_relaxed = ratio x p35, capped at 1.0)")
+
+    records = []
+    for mode in modes:
+        print(f"\n  -- mode: {mode} --")
+        for p in sweep_ps:
+            if mode == "matched":
+                p10, p35 = p, p
+            elif mode == "p10_only":
+                p10, p35 = p, cfg.motif_p35
+            elif mode == "p35_only":
+                p10, p35 = cfg.motif_p10, p
+            else:
+                print(f"    unknown mode {mode!r}, skipping")
+                continue
+            p35_relaxed = min(1.0, p35 * p35_relaxed_ratio)
+
+            t0 = time.perf_counter()
+            m10, m35s, m35r = _load_motifs_from_file(
+                meme_file, p10, p35, p35_relaxed, bg=bg)
+            _, best = _scan_sequences_for_motifs(
+                all_igr, m10, m35s, m35r)
+            elapsed = time.perf_counter() - t0
+
+            counts = _scan_counts(best, marker_ids)
+            row = {"mode": mode, "sweep_p": p,
+                    "p10": p10, "p35": p35, "p35_relaxed": p35_relaxed,
+                    "bg_a": bg[0], "bg_c": bg[1], "bg_g": bg[2], "bg_t": bg[3],
+                    "n_igrs_scanned": len(all_igr),
+                    "elapsed_s": elapsed}
+            row.update(counts)
+            records.append(row)
+            print(f"    p={p:.2e}  p10={p10:.2e} p35={p35:.2e} "
+                  f"p35r={p35_relaxed:.2e}  "
+                  f"total={counts['n_total']} "
+                  f"(A={counts['n_path_A']} B={counts['n_path_B']} "
+                  f"C={counts['n_path_C']} D={counts['n_path_D']})  "
+                  f"marker={counts['n_marker']}  "
+                  f"{elapsed:.1f}s")
+
+    sweep_df = pd.DataFrame(records)
+    cols = ["mode", "sweep_p", "p10", "p35", "p35_relaxed",
+            "bg_a", "bg_c", "bg_g", "bg_t",
+            "n_igrs_scanned",
+            "n_total", "n_path_A", "n_path_B", "n_path_C", "n_path_D",
+            "n_marker", "n_marker_path_A", "n_marker_path_B",
+            "n_marker_path_C", "n_marker_path_D",
+            "elapsed_s"]
+    sweep_df = sweep_df[cols]
+    sweep_df.to_csv(out_tsv, sep="\t", index=False)
+    print(f"\n  Sweep table ({len(sweep_df)} rows) -> {out_tsv}")
+
+    try:
+        _render_p_sweep_figure(sweep_df, out_png)
+    except Exception as e:
+        print(f"  Figure rendering failed: {e}")
+
+    print("  Diagnostic complete.\n")
 
 
 # =====================================================================
@@ -2149,6 +2651,32 @@ def main():
                              "promoter sequences in additional FASTA outputs "
                              "and the final table. 0 = disabled (default: 0)")
 
+    # Diagnostic: -10 / -35 p-value sweep
+    parser.add_argument("--diagnose-p-sweep", action="store_true",
+                        help="Run the p-value sweep diagnostic after step 7 "
+                             "instead of running step 8 onward. Sweeps -10 "
+                             "and -35 PWM thresholds in three modes "
+                             "(matched, p10_only, p35_only) and writes "
+                             "diagnostics/p_sweep.tsv plus a figure.")
+    parser.add_argument("--sweep-min", type=float, default=1e-5,
+                        help="Smallest p-value in the sweep "
+                             "(default: 1e-5)")
+    parser.add_argument("--sweep-max", type=float, default=1e-1,
+                        help="Largest p-value in the sweep "
+                             "(default: 1e-1)")
+    parser.add_argument("--sweep-n", type=int, default=13,
+                        help="Number of log-spaced sweep points "
+                             "(default: 13)")
+    parser.add_argument("--sweep-modes", default="matched,p10_only,p35_only",
+                        help="Comma-separated list of sweep modes "
+                             "(default: matched,p10_only,p35_only). "
+                             "Valid modes: matched | p10_only | p35_only.")
+    parser.add_argument("--sweep-p35-relaxed-ratio", type=float, default=20.0,
+                        help="In every sweep point, p35_relaxed is set to "
+                             "this ratio x p35 (capped at 1.0). Default "
+                             "ratio 20 matches the pipeline default of "
+                             "2.5e-3 strict / 5e-2 relaxed.")
+
     args = parser.parse_args()
 
     if args.list:
@@ -2234,6 +2762,36 @@ def _run_pipeline(cfg, args):
     if not args.force:
         print("Checkpoint mode: steps with existing output will be skipped.")
         print("Use --force to re-run all steps.\n")
+
+    # Diagnostic mode: run steps 1-7 (the prerequisites — Prokka, IGR
+    # extraction, operons, HMM, marker matching) and replace steps
+    # 8-11 with the p-value sweep. Cached step outputs are reused, so
+    # multiple --diagnose-p-sweep runs against the same genome with
+    # different sweep windows reuse Prokka / hmmsearch.
+    if getattr(args, "diagnose_p_sweep", False):
+        DIAGNOSTIC_PREREQS = 7
+        for num, name, func in STEPS:
+            if num > DIAGNOSTIC_PREREQS:
+                break
+            if args.start <= num <= args.end:
+                print(f"\n{'=' * 60}")
+                print(f"  STEP {num}: {name}")
+                print(f"{'=' * 60}\n")
+                func(cfg, force=args.force)
+        modes = tuple(m.strip() for m in args.sweep_modes.split(",") if m.strip())
+        print(f"\n{'=' * 60}")
+        print(f"  DIAGNOSTIC: -10 / -35 p-value sweep")
+        print(f"{'=' * 60}\n")
+        diagnose_p_sweep(
+            cfg,
+            sweep_min=args.sweep_min,
+            sweep_max=args.sweep_max,
+            sweep_n=args.sweep_n,
+            modes=modes,
+            p35_relaxed_ratio=args.sweep_p35_relaxed_ratio,
+            force=args.force,
+        )
+        return
 
     for num, name, func in STEPS:
         if args.start <= num <= args.end:
