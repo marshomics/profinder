@@ -95,6 +95,10 @@ class Config:
     def motif_dir(self) -> Path:
         return self.output_dir / "motifs"
 
+    @property
+    def diagnostics_dir(self) -> Path:
+        return self.output_dir / "diagnostics"
+
     # ── Prokka outputs ───────────────────────────────────────────────
     @property
     def gff_file(self) -> Path:
