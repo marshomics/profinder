@@ -58,6 +58,13 @@ class Config:
     motif_p10: float = 2.5e-3        # p-value threshold for -10 hits
     motif_p35: float = 2.5e-3        # strict -35 threshold (Path A, Path C)
     motif_p35_relaxed: float = 0.05  # relaxed -35 threshold (Path B only)
+    # Distance-from-CDS-start cutoff: the right edge of the -10 motif
+    # must sit within this many bp of the downstream CDS start.
+    # Default 200 captures the bulk of literature σ⁷⁰ leader lengths
+    # (5'UTR usually < 200 bp) while dropping distal motifs in long
+    # IGRs that are unlikely to drive the downstream gene. Set to a
+    # large value (e.g. 100000) to effectively disable.
+    max_dist_to_cds_start: int = 200
 
     def __post_init__(self):
         """Resolve bundled HMM and MEME paths if none were provided."""
