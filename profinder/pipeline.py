@@ -26,8 +26,13 @@ strands since each strand carries the promoter for one of the two
 flanking genes. When multiple subgroups exceed threshold at the same
 position, the most-significant one (lowest empirical p-value under
 the per-genome background) is reported, with raw log-odds as the
-tiebreaker. Paths A–C require a -35 hit with a 15–19 bp spacer to the
--10 hit; Path D requires only an extended -10. Each -10 hit is
+tiebreaker. Paths A–C require a -35 hit with a 16–18 bp spacer to the
+-10 hit (canonical σ⁷⁰ spacer is 17 ± 1); Path D requires only an
+extended -10. -10 motifs whose right edge sits further than
+``cfg.max_dist_to_cds_start`` bp from the downstream CDS start
+(default 200) are dropped before the spacer search — distal motifs
+in long IGRs are unlikely to drive the downstream gene and contribute
+disproportionately to false-positive predictions. Each -10 hit is
 classified as Path A (linked strict -35, same subgroup), Path B
 (extended -10 with a linked relaxed -35, same subgroup), Path C
 (unlinked strict -35, different subgroups), or Path D (extended -10
@@ -130,8 +135,15 @@ def _revcomp_simple(s: str) -> str:
 # =====================================================================
 
 _MOTIF_WIDTH = 6
-_SPACER_MIN = 15
-_SPACER_MAX = 19
+# Spacer window between -35 and -10 motifs. Canonical σ⁷⁰ spacer is
+# 17 ± 1 bp (Hawley & McClure 1983; Lisser & Margalit 1993); we
+# accept 16-18 bp so the modal 17 bp case sits in the middle of the
+# window with one nt of tolerance either side. Earlier versions of
+# ProFinder used the looser 15-19 bp window, which captured more
+# real promoters but also accepted edge cases where the geometry no
+# longer supports σ⁷⁰ holoenzyme contacts at both motifs.
+_SPACER_MIN = 16
+_SPACER_MAX = 18
 _BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 
 
@@ -463,7 +475,8 @@ def _load_motifs_from_file(meme_path, p10, p35_strict, p35_relaxed,
     return m10, m35_strict, m35_relaxed
 
 
-def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
+def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed,
+                                max_dist_to_cds_start=None):
     """Scan one strand for promoter candidates. Returns a list of result dicts.
 
     Before scoring, a low-complexity mask is computed over the strand
@@ -472,9 +485,22 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     (which the -10 PWM is otherwise prone to call) do not contribute
     spurious hits.
 
+    If ``max_dist_to_cds_start`` is provided, -10 hits whose right
+    edge sits further than that many bases from the end of ``seq`` are
+    dropped before the spacer search. This assumes ``seq`` is oriented
+    5'→3' relative to the downstream gene so that the right end of
+    ``seq`` is adjacent to the downstream CDS start — true for the
+    ``+`` strand of CO_F/CO_R IGRs after step 2's orientation
+    normalization, and for both strands of DP IGRs (each strand
+    promotes one of the two flanking genes, and in each case the
+    "downstream gene" sits immediately past the right end of the
+    scanned strand). Distance from the right edge of the -10 to the
+    CDS start = ``len(seq) - pos_10 - motif_width``.
+
     Each -10 hit is classified into one of four paths, in priority
-    order. Paths A–C require a -35 hit with a 15–19 bp spacer; Path D
-    requires only an extended -10:
+    order. Paths A–C require a -35 hit with a 16-18 bp spacer
+    (canonical σ⁷⁰ spacer is 17 ± 1); Path D requires only an
+    extended -10:
 
         A  Linked -10 and strict -35 (same subgroup).
         B  Extended -10 ("TG" immediately upstream — at -2/-1 OR
@@ -484,7 +510,7 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
            "TG" at -3/-2 of a -10 anchored at -12 to -7) or
            -14/-13 (slipped; "TG" at -2/-1).
         C  Unlinked -10 and strict -35 (different subgroups).
-        D  Extended -10 with no -35 in the 15–19 bp window.
+        D  Extended -10 with no -35 in the 16-18 bp window.
 
     Anything else is no hit and is dropped.
     """
@@ -500,9 +526,20 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
     # 6-mers that lie within that tract.
     mask = _compute_low_complexity_mask(seq)
 
+    # Distance-to-CDS filter: when active, any -10 anchor with right
+    # edge sitting more than ``max_dist_to_cds_start`` bases away from
+    # the end of ``seq`` is rejected. min_pos_10 is the smallest
+    # ``pos_10`` that satisfies the cutoff, so we can skip anchors
+    # below it in one ``i < min_pos_10`` comparison. None disables.
+    min_pos_10 = None
+    if isinstance(max_dist_to_cds_start, (int, float)) and max_dist_to_cds_start >= 0:
+        min_pos_10 = max(0, len(seq) - w - int(max_dist_to_cds_start))
+
     # Pre-scan all -10 hits
     hits_10 = []
     for i in range(max_pos + 1):
+        if min_pos_10 is not None and i < min_pos_10:
+            continue
         if i < len(mask) and mask[i]:
             continue
         hit = m10.best_hit(seq, i)
@@ -536,7 +573,7 @@ def _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
         ext10_at_m3 = pos_10 >= 3 and seq[pos_10 - 3:pos_10 - 1] == "TG"
         has_ext10 = ext10_at_m2 or ext10_at_m3
 
-        # Walk the 15–19 bp spacer window once, tracking:
+        # Walk the 16-18 bp spacer window once, tracking:
         #   best_linked_strict   — same subgroup, strict threshold (Path A)
         #   best_linked_relaxed  — same subgroup, relaxed threshold (Path B)
         #   best_unlinked_strict — different subgroup, strict threshold (Path C)
@@ -669,7 +706,8 @@ def _strands_for_orientation(orientation):
 def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
                                seq_col="sequence_5p_to_3p",
                                id_col="igr_id",
-                               orientation_col="orientation"):
+                               orientation_col="orientation",
+                               max_dist_to_cds_start=None):
     """Scan a DataFrame of sequences for -10/-35 promoter motifs.
 
     Strand selection is orientation-aware: see
@@ -679,6 +717,11 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
     describes a promoter that cannot transcribe the IGR's downstream
     marker gene. If ``orientation_col`` is absent from ``df``, both
     strands are scanned (legacy behavior).
+
+    ``max_dist_to_cds_start`` (optional) is passed through to
+    ``_find_promoters_on_strand`` and constrains the -10 anchor to
+    sit within that many bases of the downstream CDS start (= the
+    right end of the scanned strand). ``None`` disables the filter.
 
     Returns two DataFrames:
         all_hits  — every motif hit found (multiple rows per sequence possible)
@@ -707,7 +750,9 @@ def _scan_sequences_for_motifs(df, m10, m35_strict, m35_relaxed,
                         for s in strands_to_scan]
 
         for strand, seq in strand_pairs:
-            for r in _find_promoters_on_strand(seq, m10, m35_strict, m35_relaxed):
+            for r in _find_promoters_on_strand(
+                    seq, m10, m35_strict, m35_relaxed,
+                    max_dist_to_cds_start=max_dist_to_cds_start):
                 out = {id_col: igr_id, "strand": strand}
                 for k in _MOTIF_COLUMNS:
                     if k != "strand":
@@ -1375,13 +1420,16 @@ def _add_cds_column(df, contigs, n_bp):
 #  paired M###_m10 / M###_m35 subgroups.
 #
 #  Each -10 hit is classified into one of four paths. Paths A–C
-#  require a -35 hit with a 15–19 bp spacer to the -10 hit; Path D
-#  requires only an extended -10.
+#  require a -35 hit with a 16-18 bp spacer to the -10 hit (canonical
+#  σ⁷⁰ spacer is 17 ± 1); Path D requires only an extended -10. -10
+#  motifs whose right edge sits more than cfg.max_dist_to_cds_start
+#  bp from the downstream CDS start (default 200) are dropped before
+#  the spacer search.
 #    A — linked -10 and strict -35 (same subgroup)
-#    B — extended -10 (TG dinucleotide at -2/-1) and a linked
-#        relaxed -35 (same subgroup)
+#    B — extended -10 (TG dinucleotide at -2/-1 or -3/-2) and a
+#        linked relaxed -35 (same subgroup)
 #    C — unlinked -10 and strict -35 (different subgroups)
-#    D — extended -10 with no -35 in the 15–19 bp window
+#    D — extended -10 with no -35 in the 16-18 bp window
 #  Anything else is regarded as no hit.
 #
 #  Each hit also carries an empirical p-value, computed per PWM as
@@ -1492,9 +1540,11 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
     )
 
     print(f"\n  Scanning {len(all_igr)} promoter-orientation IGRs "
-          f"(orientation-aware: + strand only for CO_F/CO_R)...")
+          f"(orientation-aware: + strand only for CO_F/CO_R; "
+          f"max_dist_to_cds_start={cfg.max_dist_to_cds_start} bp)...")
     all_hits, best_all = _scan_sequences_for_motifs(
-        all_igr, m10, m35_strict, m35_relaxed)
+        all_igr, m10, m35_strict, m35_relaxed,
+        max_dist_to_cds_start=cfg.max_dist_to_cds_start)
 
     all_hits.to_csv(cfg.motif_hits_all, sep="\t", index=False)
     best_all.to_csv(cfg.motif_best_all, sep="\t", index=False)
@@ -1535,9 +1585,11 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
         )
 
     print(f"\n  Scanning {len(markers_df)} marker promoters "
-          f"(orientation-aware: + strand only for CO_F/CO_R)...")
+          f"(orientation-aware: + strand only for CO_F/CO_R; "
+          f"max_dist_to_cds_start={cfg.max_dist_to_cds_start} bp)...")
     marker_hits, best_markers = _scan_sequences_for_motifs(
-        markers_df, m10, m35_strict, m35_relaxed)
+        markers_df, m10, m35_strict, m35_relaxed,
+        max_dist_to_cds_start=cfg.max_dist_to_cds_start)
 
     marker_hits.to_csv(cfg.motif_hits_markers, sep="\t", index=False)
     best_markers.to_csv(cfg.motif_best_markers, sep="\t", index=False)
@@ -1882,6 +1934,8 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
     print(f"  Modes: {', '.join(modes)}")
     print(f"  p35_relaxed_ratio = {p35_relaxed_ratio} "
           f"(p35_relaxed = ratio x p35, capped at 1.0)")
+    print(f"  Spacer window: {_SPACER_MIN}-{_SPACER_MAX} bp; "
+          f"max_dist_to_cds_start = {cfg.max_dist_to_cds_start} bp")
     print(f"  Per-sweep-point profinder_results.tsv files written to:")
     print(f"    {tables_dir}/")
     print(f"  Each table is filtered to motif_confirmed = True AND "
@@ -1906,7 +1960,8 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
             m10, m35s, m35r = _load_motifs_from_file(
                 meme_file, p10, p35, p35_relaxed, bg=bg)
             _, best = _scan_sequences_for_motifs(
-                all_igr, m10, m35s, m35r)
+                all_igr, m10, m35s, m35r,
+                max_dist_to_cds_start=cfg.max_dist_to_cds_start)
             elapsed = time.perf_counter() - t0
 
             counts = _scan_counts(best, marker_ids)
@@ -2793,6 +2848,14 @@ def main():
                         help="Relaxed p-value threshold for -35 motif hits, "
                              "used only for Path B (extended -10) "
                              "(default: 0.05)")
+    parser.add_argument("--max-dist-to-cds-start", type=int, default=200,
+                        help="Maximum distance (bp) between the right edge "
+                             "of the -10 motif and the downstream CDS start. "
+                             "-10 hits further out are dropped before the "
+                             "spacer search. Captures the bulk of literature "
+                             "σ⁷⁰ leader lengths while filtering distal "
+                             "motifs in long IGRs that are unlikely to "
+                             "drive the downstream gene (default: 200)")
 
     # Conda environments
     parser.add_argument("--conda-prokka", default="",
@@ -2909,6 +2972,7 @@ def _build_config(args, kingdom, *, input_fasta, output_dir, prokka_prefix=None)
         motif_p10=args.p10,
         motif_p35=args.p35,
         motif_p35_relaxed=args.p35_relaxed,
+        max_dist_to_cds_start=args.max_dist_to_cds_start,
         cds_bp=args.cds_bp,
     )
 
