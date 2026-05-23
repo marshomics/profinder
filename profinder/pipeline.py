@@ -926,6 +926,7 @@ def step01_run_prokka(cfg: Config, force: bool = False):
         f" --prefix {cfg.prokka_prefix}"
         f" --kingdom {cfg.prokka_kingdom}"
         f" --cpus {cfg.threads}"
+        f" --rfam"
         f" --force"
         f" {input_for_prokka}"
     )
