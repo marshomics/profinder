@@ -81,8 +81,16 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
     with _open_maybe_gzip(fasta_path) as fh:
         contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(fh, "fasta")}
         
-    # Parse CDS entries from the GFF
+    # Parse gene-like entries from the GFF. Boundary features are CDS
+    # plus all non-coding RNA classes that Prokka emits when invoked with
+    # --rfam (Infernal/Rfam covariance models): tRNA, rRNA, tmRNA, ncRNA,
+    # misc_RNA. Treating these as boundaries prevents IGRs that overlap
+    # or sit inside a non-coding gene from reaching the motif scan.
+    BOUNDARY_FEATURES = {
+        "CDS", "tRNA", "rRNA", "tmRNA", "ncRNA", "misc_RNA",
+    }
     genes = []
+    feature_spans = []   # for overlap exclusion of IGR windows
     with open(str(gff_path)) as fh:
         for line in fh:
             if line.startswith("#"):
@@ -90,20 +98,33 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
                     break          # Prokka GFF embeds FASTA after this marker
                 continue
             cols = line.strip().split("\t")
-            if len(cols) < 9 or cols[2] != "CDS":
+            if len(cols) < 9:
                 continue
-            genes.append({
+            ftype = cols[2]
+            if ftype not in BOUNDARY_FEATURES:
+                continue
+            entry = {
                 "contig": cols[0],
                 "start": int(cols[3]),
                 "end": int(cols[4]),
                 "strand": cols[6],
                 "gene_id": _parse_gene_id(cols[8]),
-            })
+                "feature_type": ftype,
+            }
+            genes.append(entry)
+            feature_spans.append(entry)
 
     if not genes:
         return pd.DataFrame()
 
     df = pd.DataFrame(genes).sort_values(["contig", "start"]).reset_index(drop=True)
+
+    # Build per-contig sorted span lists for quick overlap rejection.
+    spans_by_contig: dict[str, list[tuple[int, int]]] = {}
+    for f in feature_spans:
+        spans_by_contig.setdefault(f["contig"], []).append((f["start"], f["end"]))
+    for k in spans_by_contig:
+        spans_by_contig[k].sort()
 
     # Walk consecutive gene pairs on each contig.  We track the farthest
     # end seen so far (``max_end``) rather than the previous gene's end,
@@ -131,7 +152,21 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
                 igr_end = curr["start"] - 1
                 igr_len = igr_end - igr_start + 1
 
-                if size_min <= igr_len <= size_max:
+                # Defensive: reject IGR windows that overlap any annotated
+                # feature on the same contig. With --rfam on, this catches
+                # Rfam-only features (sRNAs, riboswitches, etc.) whose
+                # coordinates fall between two CDS without bounding them.
+                contig_spans = spans_by_contig.get(contig_id, [])
+                overlaps_feature = any(
+                    not (f_end < igr_start or f_start > igr_end)
+                    and not (f_start == left_gene_for_gap["start"]
+                             and f_end == left_gene_for_gap["end"])
+                    and not (f_start == curr["start"]
+                             and f_end == curr["end"])
+                    for f_start, f_end in contig_spans
+                )
+
+                if size_min <= igr_len <= size_max and not overlaps_feature:
                     left = left_gene_for_gap
                     right = curr
                     orientation = _classify_orientation(left["strand"], right["strand"])
