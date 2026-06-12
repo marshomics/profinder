@@ -1,5 +1,5 @@
 """
-Configuration for ProFinder — bacterial and archaeal promoter identification
+Configuration for ProFinder — bacterial promoter identification
 pipeline.
 
 All paths are resolved at runtime so they work whether passed via CLI
