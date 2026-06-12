@@ -1,19 +1,6 @@
 """
 Extract intergenic regions (IGRs) directly from a Prokka GFF and the
 corresponding genome FASTA.
-
-This replaces PIGGY for the single-genome case. PIGGY is designed for
-pangenome analysis across multiple genomes and requires Roary output;
-here we parse gene coordinates from the GFF, compute intergenic gaps,
-classify each by the orientation of the flanking genes, and pull the
-sequence from the FASTA.
-
-Orientation labels mirror PIGGY's convention:
-
-    CO_F   → ← IGR → →   co-oriented forward (downstream gene on + strand)
-    CO_R   ← ← IGR ← ←   co-oriented reverse (downstream gene on − strand)
-    DP     ← IGR →        divergent promoter  (genes point away from IGR)
-    CONV   → IGR ←        convergent / terminator (genes point into IGR)
 """
 
 import pandas as pd
