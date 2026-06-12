@@ -6,7 +6,6 @@ Takes a single genome FASTA, annotates it with Prokka, extracts
 intergenic regions, identifies operons, screens for HMM marker genes,
 and outputs promoter sequences in 5'-to-3' orientation.
 
-Use ``--domain bacteria`` (default) or ``--domain archaea``.
 Promoter verification is performed by scanning for -10/-35 hexamer
 motifs using position weight matrices from the bundled
 ``all_unique_subgroups.meme`` file. PWM log-odds, score thresholds,
