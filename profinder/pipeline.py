@@ -1643,7 +1643,7 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
 #
 # In every mode the relaxed -35 threshold (used only for Path B) is
 # pinned to `p35 * p35_relaxed_ratio` (default ratio 20, matching the
-# pipeline's default 2.5e-3 strict / 5e-2 relaxed). Capped at 1.0 so
+# pipeline's default 1e-2 strict / 2e-1 relaxed). Capped at 1.0 so
 # extreme sweep points don't blow past valid probability.
 #
 # All sweep points share the per-genome A/C/G/T background, computed
@@ -2139,19 +2139,34 @@ def _get_associated_gene(row):
     return ""
 
 
-def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50):
+def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50,
+                             max_len=None):
     """Build an inline SVG showing motif positions along a promoter sequence.
+
+    The promoter bar is drawn proportional to its actual length and
+    right-aligned: its 3' end (adjacent to the downstream CDS, where the
+    -10/-35 elements sit) is flush with the right margin, so the
+    gene-proximal ends line up across rows. ``max_len`` is the longest
+    promoter length in the displayed set and sets the shared
+    bp-to-pixel scale; when it is None or non-positive the bar fills the
+    full width (legacy behaviour).
 
     Returns an SVG string.
     """
     if seq_len == 0:
         return ""
 
+    if not isinstance(max_len, (int, float)) or max_len <= 0:
+        max_len = seq_len
+
     margin = 10
     track_y = 25
     track_h = 10
-    bar_w = width - 2 * margin
-    scale = bar_w / seq_len
+    full_w = width - 2 * margin             # drawing area between margins
+    scale = full_w / max_len                # shared px per bp across rows
+    bar_w = seq_len * scale                  # this promoter's bar width
+    bar_left = margin + (full_w - bar_w)     # right-align: 3' end at right margin
+    bar_right = width - margin
 
     # Colour palette for motif elements
     db_colours = {
@@ -2164,15 +2179,15 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50):
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'style="background:#fafafa;border:1px solid #ddd;border-radius:4px;">',
-        # Sequence track (grey bar)
-        f'<rect x="{margin}" y="{track_y}" width="{bar_w}" height="{track_h}" '
+        # Sequence track (grey bar): proportional to length, right-aligned
+        f'<rect x="{bar_left:.1f}" y="{track_y}" width="{bar_w:.1f}" height="{track_h}" '
         f'fill="#e0e0e0" rx="3"/>',
-        # 5' and 3' labels
-        f'<text x="{margin}" y="16" font-size="11" fill="#666">5\'</text>',
-        f'<text x="{width - margin - 10}" y="16" font-size="11" fill="#666">3\'</text>',
-        # Length label
-        f'<text x="{width / 2}" y="16" font-size="10" fill="#999" text-anchor="middle">'
-        f'{seq_len} bp</text>',
+        # 5' label at this bar's (variable) left edge; 3' at the right margin
+        f'<text x="{bar_left:.1f}" y="16" font-size="11" fill="#666">5\'</text>',
+        f'<text x="{bar_right - 10}" y="16" font-size="11" fill="#666">3\'</text>',
+        # Length label centered over this bar
+        f'<text x="{bar_left + bar_w / 2:.1f}" y="16" font-size="10" fill="#999" '
+        f'text-anchor="middle">{seq_len} bp</text>',
     ]
 
     for hit in motif_hits:
@@ -2182,8 +2197,10 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50):
         motif_name = hit.get("motif_id", "")
         colour = db_colours.get(db, default_colour)
 
-        x = margin + (start - 1) * scale
-        w = max((stop - start + 1) * scale, 3)  # at least 3px wide
+        # Positions are 1-based along the 5'->3' sequence; place them
+        # relative to this bar's left edge using the shared scale.
+        x = bar_left + (start - 1) * scale
+        w = max((stop - start + 1) * scale, 2)  # at least 2px wide
 
         parts.append(
             f'<rect x="{x:.1f}" y="{track_y - 2}" width="{w:.1f}" height="{track_h + 4}" '
@@ -2305,7 +2322,9 @@ def step11_generate_report(cfg: Config, force: bool = False):
             by=["_path_rank", "_score_key"], ascending=[True, False]
         ).drop(columns=["_path_rank", "_score_key"])
 
-    # Build HTML
+    # Build HTML. Summary statistics are over the full verified set;
+    # the table below is capped at the top 10 after the path-then-
+    # combined-significance sort.
     n_promoters = len(promoter_df)
     n_annotated = sum(1 for _, r in promoter_df.iterrows()
                       if r["associated_gene"] in annotation_map
@@ -2313,6 +2332,18 @@ def step11_generate_report(cfg: Config, force: bool = False):
     n_with_motifs = sum(1 for _, r in promoter_df.iterrows()
                         if has_motif_cols and pd.notna(r.get("motif_pos_10"))
                         and str(r.get("motif_pos_10")) != ".")
+
+    # Render only the top 10 promoters. The sort above already orders by
+    # path priority (A > B > C > D) then combined -log10(p) descending,
+    # so head(10) is the top 10 in the requested order.
+    top_df = promoter_df.head(10).copy()
+    n_shown = len(top_df)
+    # Longest promoter among the displayed rows sets the shared
+    # bp-to-pixel scale for the right-aligned motif diagrams.
+    try:
+        max_len_display = int(top_df["length"].max())
+    except (ValueError, TypeError):
+        max_len_display = 0
 
     genome_name = cfg.input_fasta.stem
 
@@ -2329,6 +2360,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
     html_parts = [_REPORT_HTML_HEAD.format(
         genome_name=html_mod.escape(genome_name),
         n_marker_promoters=n_promoters,
+        n_shown=n_shown,
         n_all_promoters=n_all_promoters,
         n_annotated=n_annotated,
         n_with_motifs=n_with_motifs,
@@ -2343,9 +2375,9 @@ def step11_generate_report(cfg: Config, force: bool = False):
     html_parts.append("""
     <div class="legend">
         <strong>Motif path:</strong>
-        <span class="legend-item"><span class="path path-a">A</span> linked &minus;10/&minus;35 (same subgroup), 15&ndash;19 bp</span>
-        <span class="legend-item"><span class="path path-b">B</span> extended &minus;10 + linked relaxed &minus;35 (same subgroup), 15&ndash;19 bp</span>
-        <span class="legend-item"><span class="path path-c">C</span> unlinked &minus;10/&minus;35 (different subgroups), 15&ndash;19 bp</span>
+        <span class="legend-item"><span class="path path-a">A</span> linked &minus;10/&minus;35 (same subgroup), 16&ndash;18 bp</span>
+        <span class="legend-item"><span class="path path-b">B</span> extended &minus;10 + linked relaxed &minus;35 (same subgroup), 16&ndash;18 bp</span>
+        <span class="legend-item"><span class="path path-c">C</span> unlinked &minus;10/&minus;35 (different subgroups), 16&ndash;18 bp</span>
         <span class="legend-item"><span class="path path-d">D</span> extended &minus;10, no &minus;35 in window</span>
     </div>
     <div class="legend">
@@ -2355,7 +2387,10 @@ def step11_generate_report(cfg: Config, force: bool = False):
         <span class="legend-item"><span class="legend-swatch" style="background:#ff8f00"></span>Extended &minus;10 (TG)</span>
     </div>
     <p style="font-size:0.8rem; color:#777; margin-bottom:16px;">
-        Rows are sorted by path priority (A &rarr; B &rarr; C), then by &minus;10 score.
+        Showing the top 10 promoters, sorted by path priority
+        (A &rarr; B &rarr; C &rarr; D), then by combined
+        &minus;log<sub>10</sub>(p) descending. Sequence diagrams are drawn
+        proportional to promoter length and aligned on the 3' (gene-proximal) end.
     </p>
     """)
 
@@ -2383,7 +2418,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
     <tbody>
     """)
 
-    for _, row in promoter_df.iterrows():
+    for _, row in top_df.iterrows():
         igr_id = row["igr_id"]
         gene = row["associated_gene"]
         product = annotation_map.get(gene, "")
@@ -2432,7 +2467,8 @@ def step11_generate_report(cfg: Config, force: bool = False):
                 except (ValueError, TypeError):
                     pass
 
-        svg = _build_motif_diagram_svg(row["length"], motif_hits)
+        svg = _build_motif_diagram_svg(row["length"], motif_hits,
+                                       max_len=max_len_display)
 
         orient_class = "co-f" if row["orientation"] == "CO_F" else "co-r"
         seq = row.get("sequence_5p_to_3p", "")
@@ -2607,7 +2643,7 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
     Domain: <strong>{domain_label}</strong> · Verification: <strong>&minus;10/&minus;35 motif scan</strong><br/>
-    This report shows the <strong>{n_marker_promoters}</strong> marker-filtered promoters confirmed by &minus;10/&minus;35 motif scanning.
+    This table lists the <strong>top {n_shown}</strong> of {n_marker_promoters} marker-filtered promoters confirmed by &minus;10/&minus;35 motif scanning, ranked by motif path (A&rarr;B&rarr;C&rarr;D) then combined &minus;log<sub>10</sub>(p).
     A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome.
 </p>
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
@@ -2838,16 +2874,16 @@ def main():
                         help="Single MEME file with paired M###_m10 / "
                              "M###_m35 subgroup motifs "
                              "(default: bundled all_unique_subgroups.meme)")
-    parser.add_argument("--p10", type=float, default=2.5e-3,
+    parser.add_argument("--p10", type=float, default=1e-2,
                         help="p-value threshold for -10 motif hits "
-                             "(default: 0.0025)")
-    parser.add_argument("--p35", type=float, default=2.5e-3,
+                             "(default: 0.01)")
+    parser.add_argument("--p35", type=float, default=1e-2,
                         help="Strict p-value threshold for -35 motif hits, "
-                             "used for Path A and Path C (default: 0.0025)")
-    parser.add_argument("--p35-relaxed", type=float, default=0.05,
+                             "used for Path A and Path C (default: 0.01)")
+    parser.add_argument("--p35-relaxed", type=float, default=0.20,
                         help="Relaxed p-value threshold for -35 motif hits, "
                              "used only for Path B (extended -10) "
-                             "(default: 0.05)")
+                             "(default: 0.20)")
     parser.add_argument("--max-dist-to-cds-start", type=int, default=200,
                         help="Maximum distance (bp) between the right edge "
                              "of the -10 motif and the downstream CDS start. "
@@ -2909,7 +2945,7 @@ def main():
                         help="In every sweep point, p35_relaxed is set to "
                              "this ratio x p35 (capped at 1.0). Default "
                              "ratio 20 matches the pipeline default of "
-                             "2.5e-3 strict / 5e-2 relaxed.")
+                             "1e-2 strict / 2e-1 relaxed.")
 
     args = parser.parse_args()
 

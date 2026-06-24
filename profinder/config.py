@@ -55,9 +55,12 @@ class Config:
     # ── Motif scanning parameters ────────────────────────────────────
     meme_file: Path = None           # single .meme file holding paired
                                      # M###_m10 / M###_m35 subgroup motifs
-    motif_p10: float = 2.5e-3        # p-value threshold for -10 hits
-    motif_p35: float = 2.5e-3        # strict -35 threshold (Path A, Path C)
-    motif_p35_relaxed: float = 0.05  # relaxed -35 threshold (Path B only)
+    # Default thresholds are the manuscript-selected operating point,
+    # fixed by the 39-point (p10, p35) sweep on the two benchmark
+    # organisms: p10 = p35 = 1e-2, relaxed -35 = 2e-1 (= 20 x strict).
+    motif_p10: float = 1e-2          # p-value threshold for -10 hits
+    motif_p35: float = 1e-2          # strict -35 threshold (Path A, Path C)
+    motif_p35_relaxed: float = 0.20  # relaxed -35 threshold (Path B only)
     # Distance-from-CDS-start cutoff: the right edge of the -10 motif
     # must sit within this many bp of the downstream CDS start.
     # Default 200 captures the bulk of literature σ⁷⁰ leader lengths

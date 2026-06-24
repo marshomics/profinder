@@ -8,6 +8,15 @@ from Bio import SeqIO
 import gzip
 
 
+# Feature types whose upstream IGR counts as a putative promoter region.
+# CDS plus the two stable, highly transcribed RNA gene classes — rRNA and
+# tRNA — whose operons carry some of the strongest constitutive promoters
+# in bacteria (e.g. the rrn P1/P2 promoters). tmRNA, ncRNA and misc_RNA
+# are deliberately excluded: they still act as boundaries (see
+# BOUNDARY_FEATURES in extract_igrs), but an IGR that would only drive one
+# of them is not emitted as a promoter candidate.
+PROMOTER_TARGET_FEATURES = {"CDS", "rRNA", "tRNA"}
+
 
 def _open_maybe_gzip(path):
     path = str(path)
@@ -57,11 +66,17 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
     size_min, size_max : int
         Keep IGRs whose length falls in [size_min, size_max].
 
+    Non-coding RNA features (tRNA, rRNA, tmRNA, ncRNA, misc_RNA) act as
+    boundaries so IGRs never overlap or cross them. An IGR is emitted only
+    when its downstream (promoter-target) gene is a CDS, rRNA, or tRNA
+    (see PROMOTER_TARGET_FEATURES); IGRs that would only drive a tmRNA,
+    ncRNA, or misc_RNA are dropped.
+
     Returns
     -------
     pd.DataFrame
         Columns: igr_id, contig, start, end, length, orientation,
-                 left_gene, right_gene, sequence
+                 left_gene, right_gene, left_type, right_type, sequence
     """
     # Load contig sequences
     # contigs = {rec.id: str(rec.seq) for rec in SeqIO.parse(str(fasta_path), "fasta")}
@@ -158,21 +173,42 @@ def extract_igrs(gff_path, fasta_path, size_min=75, size_max=1000):
                     right = curr
                     orientation = _classify_orientation(left["strand"], right["strand"])
 
-                    # Extract sequence (GFF is 1-based; Python slicing is 0-based)
-                    seq = contig_seq[igr_start - 1 : igr_end] if contig_seq else ""
+                    # Only emit putative promoter regions whose downstream
+                    # (promoter-target) gene is in PROMOTER_TARGET_FEATURES
+                    # (CDS, rRNA, tRNA). The non-coding RNA classes all
+                    # still act as boundaries above, so IGRs never overlap
+                    # or cross a tRNA/rRNA/tmRNA/ncRNA/misc_RNA — but an IGR
+                    # that would only drive a tmRNA, ncRNA, or misc_RNA is
+                    # not a promoter candidate and is skipped here. The
+                    # downstream gene is the right feature for CO_F and the
+                    # left feature for CO_R; DP/CONV carry no single
+                    # downstream target and are excluded from the promoter
+                    # set in later steps, so they pass through unchanged.
+                    if orientation == "CO_F":
+                        emit = right["feature_type"] in PROMOTER_TARGET_FEATURES
+                    elif orientation == "CO_R":
+                        emit = left["feature_type"] in PROMOTER_TARGET_FEATURES
+                    else:
+                        emit = True
 
-                    igr_counter += 1
-                    rows.append({
-                        "igr_id": f"igr_{igr_counter:06d}",
-                        "contig": contig_id,
-                        "start": igr_start,
-                        "end": igr_end,
-                        "length": igr_len,
-                        "orientation": orientation,
-                        "left_gene": left["gene_id"],
-                        "right_gene": right["gene_id"],
-                        "sequence": seq,
-                    })
+                    if emit:
+                        # Extract sequence (GFF is 1-based; Python slicing is 0-based)
+                        seq = contig_seq[igr_start - 1 : igr_end] if contig_seq else ""
+
+                        igr_counter += 1
+                        rows.append({
+                            "igr_id": f"igr_{igr_counter:06d}",
+                            "contig": contig_id,
+                            "start": igr_start,
+                            "end": igr_end,
+                            "length": igr_len,
+                            "orientation": orientation,
+                            "left_gene": left["gene_id"],
+                            "right_gene": right["gene_id"],
+                            "left_type": left["feature_type"],
+                            "right_type": right["feature_type"],
+                            "sequence": seq,
+                        })
 
             # Advance the right-boundary tracker
             max_end = curr["end"]
