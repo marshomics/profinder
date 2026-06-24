@@ -24,6 +24,11 @@ dependencies = [
     "biopython>=1.79",
 ]
 
+[project.optional-dependencies]
+# matplotlib is only needed to render the figure produced by
+# --diagnose-p-sweep; the pipeline itself does not import it.
+diagnostics = ["matplotlib>=3.4"]
+
 [project.scripts]
 profinder = "profinder.pipeline:main"
 
@@ -34,4 +39,4 @@ Repository = "https://github.com/jmarsh/profinder"
 include = ["profinder*"]
 
 [tool.setuptools.package-data]
-profinder = ["all_unique_subgroups.meme", "hmms/*.hmm", "weights/**/*"]
+profinder = ["all_unique_subgroups.meme", "hmms/*.hmm", "motifs/*.meme"]
