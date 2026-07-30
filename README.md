@@ -7,7 +7,7 @@ ProFinder extracts high-confidence constitutive promoter candidates from a singl
 
 ## Access the server
 
-[ProFinder Web Interface](https://plabase.cs.uni-tuebingen.de/profinder/)
+[ProFinder Web Interface](https://services-ab.cs.uni-tuebingen.de/profinder/)
 
 
 ## How the pipeline works
