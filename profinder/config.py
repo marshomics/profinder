@@ -1,0 +1,223 @@
+"""
+Configuration for ProFinder — bacterial promoter identification
+pipeline.
+
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+@dataclass
+class Config:
+    # ── Required inputs ──────────────────────────────────────────────
+    input_fasta: Path = Path("genome.fasta")
+    output_dir: Path = Path("output")
+
+    # ── Domain selection ─────────────────────────────────────────────
+    domain: str = "bacteria" 
+
+    # ── Tool paths ───────────────────────────────────────────────────
+    prokka_bin: str = "prokka"
+    hmmsearch_bin: str = "hmmsearch"
+    conda_env_prokka: str = ""   # leave blank to skip conda activate
+    conda_env_hmm: str = ""
+
+    # ── HMM profiles directory (bundled by default) ────────────────
+    hmm_profiles_dir: Path = None
+
+    # ── Parallelism ──────────────────────────────────────────────────
+    threads: int = 4
+    num_workers: int = 4
+
+    # ── Prokka parameters ────────────────────────────────────────────
+    prokka_kingdom: str = "Bacteria"
+    prokka_prefix: str = "genome"
+
+    # ── IGR extraction parameters ────────────────────────────────────
+    igr_size_min: int = 81
+    igr_size_max: int = 1000
+
+    # ── Operon identification parameters ─────────────────────────────
+    max_internal_distance: int = 25
+    min_flanking_distance: int = 75
+
+    # ── HMM filtering ────────────────────────────────────────────────
+    hmm_bitscore_min: float = 25.0
+
+    # ── CDS extension ────────────────────────────────────────────────
+    cds_bp: int = 0                   # nt of downstream CDS appended to the
+                                      # sequence_5p_to_3p_cds column of
+                                      # profinder_results.tsv (0 = disabled)
+
+    # ── Motif scanning parameters ────────────────────────────────────
+    meme_file: Path = None           # single .meme file holding paired
+                                     # M###_m10 / M###_m35 subgroup motifs
+    motif_p10: float = 1e-2          # p-value threshold for -10 hits
+    motif_p35: float = 1e-3          # strict -35 threshold (Path A, Path C)
+    motif_p35_relaxed: float = 3e-2  # relaxed -35 threshold (Path B only)
+    # Distance-from-CDS-start cutoff: the right edge of the -10 motif
+    # must sit within this many bp of the downstream CDS start.
+    
+    # Raising further buys almost nothing: over 300 bp, 400 bp adds 0.18 pp
+    # of pooled recall and 500 bp 0.22 pp.
+    # Set to a large value (e.g. 100000) to effectively disable.
+    max_dist_to_cds_start: int = 300
+
+    # ── Empirical scoring / PPV calibration ──────────────────────────
+    n_shuffles: int = 10             # dinucleotide shuffles per interval
+                                     # for the per-genome null
+    ppv_calibration: Path = None     # per-path calibration JSON
+    ppv_prior: float = None          # prevalence prior for ppv_interval
+                                     # (None -> report LR+ and IQR only)
+
+    def __post_init__(self):
+        """Resolve bundled HMM and MEME paths if none were provided."""
+        if self.hmm_profiles_dir is None:
+            candidate = Path(__file__).parent / "hmms"
+            self.hmm_profiles_dir = candidate if candidate.is_dir() else None
+
+        if self.meme_file is None:
+            candidate = Path(__file__).parent / "all_unique_subgroups.meme"
+            self.meme_file = candidate if candidate.is_file() else None
+
+        # Normalise domain to lowercase
+        self.domain = self.domain.lower()
+
+    # ── Subdirectories ───────────────────────────────────────────────
+    # Intermediates go into sub-process directories. Only the final
+    # deliverables live at the top level of output_dir.
+    @property
+    def prokka_dir(self) -> Path:
+        return self.output_dir / "prokka"
+
+    @property
+    def igr_dir(self) -> Path:
+        return self.output_dir / "igr"
+
+    @property
+    def hmm_dir(self) -> Path:
+        return self.output_dir / "hmm"
+
+    @property
+    def operon_dir(self) -> Path:
+        return self.output_dir / "operons"
+
+    @property
+    def motif_dir(self) -> Path:
+        return self.output_dir / "motifs"
+
+    @property
+    def diagnostics_dir(self) -> Path:
+        return self.output_dir / "diagnostics"
+
+    # ── Prokka outputs ───────────────────────────────────────────────
+    @property
+    def gff_file(self) -> Path:
+        return self.prokka_dir / f"{self.prokka_prefix}.gff"
+
+    @property
+    def faa_file(self) -> Path:
+        return self.prokka_dir / f"{self.prokka_prefix}.faa"
+
+    @property
+    def fna_file(self) -> Path:
+        return self.prokka_dir / f"{self.prokka_prefix}.fna"
+
+    # ── IGR outputs ──────────────────────────────────────────────────
+    @property
+    def igr_fasta(self) -> Path:
+        return self.igr_dir / "intergenic_regions.fasta"
+
+    @property
+    def igr_summary(self) -> Path:
+        return self.igr_dir / "igr_summary.tsv"
+
+    # ── HMM outputs ──────────────────────────────────────────────────
+    @property
+    def hmm_combined(self) -> Path:
+        return self.hmm_dir / "hmm_combined.tsv"
+
+    @property
+    def hmm_filtered(self) -> Path:
+        return self.hmm_dir / "hmm_filtered.tsv"
+
+    # ── Operon outputs (subdirectory) ────────────────────────────────
+    @property
+    def operon_file(self) -> Path:
+        return self.operon_dir / "operons.tsv"
+
+    @property
+    def operon_filtered(self) -> Path:
+        return self.operon_dir / "operons_filtered.tsv"
+
+    @property
+    def operon_filtered_markers(self) -> Path:
+        return self.operon_dir / "operons_filtered_markers.tsv"
+
+    @property
+    def promoter_markers(self) -> Path:
+        return self.operon_dir / "promoter_markers.tsv"
+
+    @property
+    def promoter_markers_hmm(self) -> Path:
+        return self.operon_dir / "promoter_markers_hmm.tsv"
+
+    # ── Motif scan outputs (subdirectory) ────────────────────────────
+    @property
+    def motif_hits_all(self) -> Path:
+        return self.motif_dir / "motif_hits_all.tsv"
+
+    @property
+    def motif_best_all(self) -> Path:
+        return self.motif_dir / "motif_best_all.tsv"
+
+    @property
+    def motif_hits_markers(self) -> Path:
+        return self.motif_dir / "motif_hits_markers.tsv"
+
+    @property
+    def motif_best_markers(self) -> Path:
+        return self.motif_dir / "motif_best_markers.tsv"
+
+    @property
+    def promoter_markers_verified(self) -> Path:
+        return self.motif_dir / "promoter_markers_verified.tsv"
+
+    # ── Final top-level deliverables ─────────────────────────────────
+    # Only these five files remain at the root of output_dir.
+    @property
+    def all_promoters_verified_fasta(self) -> Path:
+        """FASTA of all CO_F/CO_R IGRs that passed the MEME motif
+        thresholds. CO_R sequences are reverse-complemented so every
+        record is oriented 5'→3'."""
+        return self.output_dir / "all_promoters_verified.fasta"
+
+    @property
+    def marker_promoters_verified_fasta(self) -> Path:
+        """FASTA of CO_F/CO_R IGRs that are associated with a marker
+        gene (HMM) AND passed the MEME motif thresholds. CO_R sequences
+        are reverse-complemented so every record is oriented 5'→3'."""
+        return self.output_dir / "marker_promoters_verified.fasta"
+
+    @property
+    def cds_annotations(self) -> Path:
+        return self.output_dir / "cds_annotations.tsv"
+
+    @property
+    def final_table(self) -> Path:
+        return self.output_dir / "profinder_results.tsv"
+
+    @property
+    def report_html(self) -> Path:
+        return self.output_dir / "promoter_report.html"
+
+    @property
+    def is_archaea(self) -> bool:
+        return self.domain == "archaea"
+
+    def ensure_dirs(self):
+        """Create all output directories."""
+        for d in [self.output_dir, self.prokka_dir, self.igr_dir,
+                  self.hmm_dir, self.operon_dir, self.motif_dir]:
+            d.mkdir(parents=True, exist_ok=True)
