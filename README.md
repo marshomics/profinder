@@ -4,6 +4,14 @@
 
 ProFinder extracts high-confidence constitutive promoter candidates from a single bacterial or archaeal genome assembly. Given a FASTA file, it returns a curated shortlist of promoter sequences upstream of conserved single-copy housekeeping genes, oriented 5'→3' and ready for use in expression constructs, reporter systems, or metabolic engineering.
 
+> [!WARNING]
+> **Maintenance in progress**
+>
+> This repository is currently being updated, and the ProFinder web server is under maintenance.
+> New job submissions are paused until maintenance is complete. Jobs that were already submitted stay in the queue and will be processed afterwards.
+>
+> Expected to be back by **21 October 2026, 18:00 (Europe/Berlin)**.
+> Thank you for your patience.
 
 ## Access the server
 
