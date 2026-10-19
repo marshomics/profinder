@@ -1,0 +1,71 @@
+{
+ "model": "logistic_regression",
+ "target": "interval contains an annotated intergenic TSS",
+ "objective": "rank calls so the top of a per-genome shortlist is enriched for real promoters; precision@k, not recall",
+ "fitted_on": {
+  "genomes": 49,
+  "calls": 15243,
+  "positives": 6866,
+  "base_rate": 0.4504
+ },
+ "performance_logo": {
+  "metric": "precision@20, per genome, leave-one-genome-out",
+  "model": 0.5592,
+  "model_prec_at_10": 0.5878,
+  "base_rate": 0.4796,
+  "shipped_composite_order": 0.4694,
+  "shipped_path_only": 0.5031,
+  "shipped_score_std_only": 0.4133,
+  "genomes_above_base": "33/49",
+  "note": "the model figure is the LOGO estimate for this specification; this artifact is fitted on all 49 genomes, so the LOGO value is its out-of-sample expectation"
+ },
+ "features": [
+  "neg_log_p10",
+  "neg_log_p35_raw",
+  "score_std",
+  "spacer",
+  "n_pairs",
+  "gc",
+  "igr_len",
+  "dist_to_cds",
+  "m10_rank",
+  "m35_rank",
+  "is_pathA",
+  "is_pathB",
+  "ext10",
+  "is_co_r"
+ ],
+ "median_impute": [
+  3.167494,
+  3.14671,
+  0.516449,
+  17.0,
+  588.0,
+  0.375,
+  224.0,
+  73.0,
+  42.0,
+  47.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "coef": [
+  0.38207475,
+  0.26911079,
+  -0.25697732,
+  -0.00789208,
+  0.00037148,
+  -0.94854018,
+  0.00014201,
+  -0.00017369,
+  -0.00254602,
+  -0.00217111,
+  0.19140646,
+  -0.04662545,
+  0.47881335,
+  -0.11156134
+ ],
+ "intercept": -1.66579475
+}

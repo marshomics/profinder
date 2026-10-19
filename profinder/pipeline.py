@@ -6,51 +6,13 @@ Takes a single genome FASTA, annotates it with Prokka, extracts
 intergenic regions, identifies operons, screens for HMM marker genes,
 and outputs promoter sequences in 5'-to-3' orientation.
 
-Promoter verification is performed by scanning for -10/-35 hexamer
-motifs using position weight matrices from the bundled
-``all_unique_subgroups.meme`` file. PWM log-odds, score thresholds,
-and empirical p-values are all calibrated against per-genome A/C/G/T
-frequencies derived from the input FASTA, so significance reflects
-the composition of the genome being scanned rather than a fixed
-uniform background. The motif scan is restricted to tandem-cooriented
-IGRs (CO_F, CO_R) and scores them on the ``+`` strand of the
-already-oriented ``sequence_5p_to_3p`` only, because a ``-`` strand
-motif on such an IGR would describe a promoter pointing away from
-the downstream marker gene. Divergent (DP), convergent and terminal
-intervals are NOT scanned, even where a flanking gene is a marker:
-``empirical.scan.build_scan_engine`` filters the table to CO_F/CO_R
-before any scoring, and ``scan_igrs`` documents itself accordingly.
-When multiple subgroups exceed threshold at the same
-position, the most-significant one (lowest empirical p-value under
-the per-genome background) is reported, with raw log-odds as the
-tiebreaker. Paths A–C require a -35 hit with a 16–18 bp spacer to the
--10 hit (canonical σ⁷⁰ spacer is 17 ± 1). -10 motifs whose right edge sits further than
-``cfg.max_dist_to_cds_start`` bp from the downstream CDS start are
-dropped before the spacer search; Distal motifs in long IGRs are unlikely to drive
-the downstream gene and contribute disproportionately to
-false-positive predictions. Each -10 hit is
-classified as Path A (linked strict -35, same subgroup), Path B
-(extended -10 with a linked relaxed -35, same subgroup), or Path C
-(unlinked strict -35, different subgroups). The extended -10 anchor
-accepts "TG" only at the canonical -15/-14 placement: the two bases 5'
-of the hexamer with one base between them ("TGn" + hexamer), which for
-a -10 anchored at the textbook -12 to -7 is TSS positions -15/-14. 
-
-Within an interval the call that gets reported is the one minimising
-(path precedence, -combined significance), where combined significance
-is -log10(p10) + -log10(p35). That key selects among competing -10
-positions; it does NOT set the order of the output table. Rows are
-ordered by ``shortlist_score`` descending -- a ranker fitted on the
-49-genome panel and validated leave-one-genome-out (see ``ranker.py``).
-
 Usage
 -----
     # Minimal (Prokka + IGR extraction + operon ID + promoter output):
     profinder -i genome.fasta -o results/
 
-    # With HMM marker screening:
-    profinder -i genome.fasta -o results/ \\
-        --tigrfam /path/to/tigrfam.hmm --pfam /path/to/Pfam-A.hmm
+    # With a custom HMM profile directory (default: bundled 98 profiles):
+    profinder -i genome.fasta -o results/ --hmm-dir /path/to/hmms/
 
     # Resume after interruption (skips completed steps):
     profinder -i genome.fasta -o results/
@@ -69,7 +31,7 @@ Steps
     1.  Run Prokka (genome annotation)
     2.  Extract intergenic regions from GFF + FASTA
     3.  Identify operons from GFF
-    4.  Run hmmsearch (TIGRfam + Pfam)       [bundled HMMs used by default]
+    4.  Run hmmsearch                        [bundled HMM profiles by default]
     5.  Filter HMM output
     6.  Filter operons and add marker info
     7.  Match IGRs to marker operons
@@ -102,15 +64,13 @@ Diagnostic mode
 """
 
 import argparse
-import bisect
 import html as html_mod
 import math
-import re
 import subprocess
 import sys
-from itertools import product as iprod
 from pathlib import Path
 import gzip
+import numpy as np
 import pandas as pd
 from Bio import SeqIO
 from Bio.Seq import Seq
@@ -139,12 +99,6 @@ _BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
 
 def _parse_meme_file(filepath):
     """Parse a MEME-format file. Returns {motif_name: [[pA, pC, pG, pT], ...]}.
-
-    The motif name is the first token following ``MOTIF``. For
-    ``all_unique_subgroups.meme`` these look like ``M001_m35``,
-    ``M001_m10``, ``M002_m35`` etc — the prefix before the underscore
-    identifies the subgroup, and the ``_m10`` / ``_m35`` suffix the
-    element type.
     """
     motifs = {}
     current = None
@@ -185,14 +139,6 @@ _UNIFORM_BG = (0.25, 0.25, 0.25, 0.25)
 
 def _compute_background_from_fasta(fasta_path):
     """Compute genome-wide A/C/G/T frequencies from a FASTA.
-
-    Returns a 4-tuple ``(p_A, p_C, p_G, p_T)`` summed across all contigs,
-    case-insensitive, ignoring ambiguous bases (N, IUPAC codes) and any
-    non-letter characters. Falls back to uniform 0.25 if the FASTA is
-    empty or unreadable. Used to calibrate PWM log-odds and the
-    enumeration of k-mer probabilities for threshold / p-value lookup,
-    per the comment in ``all_unique_subgroups.meme`` that "Per-organism
-    A/C/G/T frequencies used in the scan are in per_organism_background.tsv".
     """
     counts = {"A": 0, "C": 0, "G": 0, "T": 0}
     try:
@@ -800,19 +746,6 @@ def _load_contigs(fasta_path):
 def _extract_cds_start(row, contigs, n_bp):
     """Return the first *n_bp* nucleotides of the CDS downstream of a
     promoter, oriented 5'→3' on the coding strand.
-
-    For CO_F the downstream CDS is the right gene, sitting on the +
-    strand immediately after the IGR.  Its first *n_bp* nt run left-to-
-    right starting at ``igr_end + 1``.
-
-    For CO_R the downstream CDS is the left gene, sitting on the −
-    strand immediately before the IGR.  Its coding sequence starts at
-    ``igr_start - 1`` and runs right-to-left.  We extract the last
-    *n_bp* nt of the forward strand up to that position and reverse-
-    complement them.
-
-    Returns an empty string if the contig is missing or there aren't
-    enough nucleotides available.
     """
     contig_seq = contigs.get(row["contig"], "")
     if not contig_seq:
@@ -857,41 +790,24 @@ def _add_cds_column(df, contigs, n_bp):
 #  require a -35 hit with a 16-18 bp spacer to the -10 hit (canonical
 #  σ⁷⁰ spacer is 17 ± 1). -10
 #  motifs whose right edge sits more than cfg.max_dist_to_cds_start
-#  bp from the downstream CDS start (default 200) are dropped before
-#  the spacer search.
+#  bp from the downstream CDS start (default: see Config) are dropped
+#  before the spacer search.
 #    A — linked -10 and strict -35 (same subgroup)
-#    B — extended -10 (TG dinucleotide at -2/-1 or -3/-2) and a
+#    B — extended -10 ("TGn" immediately 5' of the hexamer) and a
 #        linked relaxed -35 (same subgroup)
 #    C — unlinked -10 and strict -35 (different subgroups)
 #  Anything else is regarded as no hit.
 #
-#  Each hit also carries an empirical p-value, computed per PWM as
-#  the fraction of 4^w k-mers scoring at least as high. The best hit
-#  per IGR and the HTML report rank within each path group by
-#  -log10(p10) + -log10(p35), a cross-PWM-comparable joint
-#  significance.
+#  Each element carries an empirical quantile (emp_p_10 / emp_p_35)
+#  read from the per-genome dinucleotide-shuffle null. Within an IGR
+#  the reported call minimises (path rank, -[-log10(p10) - log10(p35)]).
+#  Output tables and the HTML report are ordered by shortlist_score
+#  (see _shortlist_order).
 # =====================================================================
 
 def step08_scan_motifs(cfg: Config, force: bool = False):
     """Score promoter-orientation IGRs with the interval-level empirical
     method (replaces the analytic per-position p-value).
-
-    A per-genome dinucleotide-shuffle null gives empirical element thresholds
-    (motif_p10 / motif_p35 / motif_p35_relaxed read as null quantiles) that
-    gate the path A/B/C search, plus a length-standardised continuous score
-    per call (the null's location fitted on log n_positions). A calibration
-    fitted on held-out genomes maps (path, score) to the base-rate-free
-    positive likelihood ratio LR+, and — only against ``--prior`` — to
-    ppv_interval (probability the INTERVAL carries a promoter, not that the
-    coordinates are the promoter). With no calibration bundled, LR+ /
-    ppv_interval are left blank rather than fabricated — and none is
-    bundled deliberately, because a fit on 49 held-out genomes showed the
-    score does not rank true against false WITHIN the called set (AUC
-    0.5007, Wilcoxon P = 0.74). 
-
-    Writes into motifs/: motif_best_all.tsv (all calls), motif_best_markers.tsv
-    and promoter_markers_verified.tsv (marker calls); and the verified FASTAs
-    at the output root.
     """
     from . import empirical as emp
 
@@ -919,20 +835,20 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
     print(f"── Empirical scan: {len(subs)} subgroups; background GC={genome_gc:.3f}; "
           f"thresholds p10={cfg.motif_p10} p35={cfg.motif_p35} "
           f"p35_relaxed={cfg.motif_p35_relaxed}; {cfg.n_shuffles} shuffles/interval ──")
-    print(f"  note: thresholds are applied to the per-architecture p-value, but the REPORTED "
-          f"emp_p_35 for Path C is")
+    print("  note: thresholds are applied to the per-architecture p-value, but the REPORTED "
+          "emp_p_35 for Path C is")
     print(f"    Šidák-adjusted over the {len(subs)-1} other architectures it searches, so a "
           f"Path C call passing p35={cfg.motif_p35:g}")
     print(f"    is reported at up to "
           f"{emp.sidak(cfg.motif_p35, len(subs)-1):.3g}. That is not an inconsistency: it is "
           f"the same evidence on a")
-    print(f"    single-test scale, comparable with Paths A and B. "
-          f"emp_p_35_uncorrected keeps the raw value.")
+    print("    single-test scale, comparable with Paths A and B. "
+          "emp_p_35_uncorrected keeps the raw value.")
 
     if cfg.motif_p35_relaxed <= cfg.motif_p35:
         print(f"  WARNING: p35_relaxed ({cfg.motif_p35_relaxed}) <= p35 "
               f"({cfg.motif_p35}). Path B (extended -10 with a relaxed same-architecture "
-              f"-35) loses the weak-{'-'}35 matches it was added to capture: with the relaxed "
+              f"-35) loses the weak -35 matches it was added to capture: with the relaxed "
               f"threshold no looser than the strict one, a qualifying -35 is normally claimed "
               f"by Path A first. Path B is not silenced outright — it still fires where a "
               f"different architecture outscores the -10's own at the -35 site, which routes "
@@ -1018,11 +934,6 @@ def _logspace_p_values(p_min, p_max, n):
     step = (log_max - log_min) / (n - 1)
     return [10.0 ** (log_min + i * step) for i in range(n)]
 
-
-# Raw per-IGR motif columns emitted by the empirical scan (step 8,
-# scan_igrs / motif_best_all.tsv), and the canonical final-table layout.
-# step10_final_table and the p-sweep diagnostic share both, so their tables
-# have an identical schema and downstream tooling ingests them the same way.
 _SCAN_MOTIF_COLS = [
     "path", "source_10", "source_35", "has_ext10",
     "emp_p_10", "emp_p_35", "emp_p_35_uncorrected", "p35_multiplicity_k",
@@ -1044,6 +955,35 @@ _FINAL_TABLE_COLUMNS = [
     "motif_lr_pos", "motif_ppv_interval", "motif_in_domain",
     "sequence_5p_to_3p",
 ]
+
+
+def _shortlist_order(df, prefix=""):
+    """Order a calls/results table for presentation.
+    """
+    if df is None or len(df) == 0:
+        return df
+    n = len(df)
+    def col(name, default):
+        return df[prefix + name] if (prefix + name) in df.columns else pd.Series(
+            [default] * n, index=df.index)
+    path = col("path", "").astype(str).str.strip()
+    called = path.isin(["A", "B", "C"]).to_numpy()
+    prank = path.map({"A": 0, "B": 1, "C": 2}).fillna(3).to_numpy(dtype=float)
+    score = pd.to_numeric(col("shortlist_score", np.nan), errors="coerce").to_numpy(dtype=float)
+    p10 = pd.to_numeric(col("emp_p_10", np.nan), errors="coerce").to_numpy(dtype=float)
+    p35 = pd.to_numeric(col("emp_p_35", np.nan), errors="coerce").to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        comb = -np.log10(np.clip(p10, 1e-300, None)) - np.log10(np.clip(p35, 1e-300, None))
+    comb = np.where(np.isfinite(comb), comb, -np.inf)
+    primary = (~called).astype(int)                      # called rows first
+    if np.isfinite(score).any():
+        k2 = -np.where(np.isfinite(score), score, -np.inf)   # score desc
+        k3 = np.zeros(n)
+    else:
+        k2 = prank
+        k3 = -comb
+    order = np.lexsort((np.arange(n), k3, k2, primary))
+    return df.iloc[order].reset_index(drop=True)
 
 
 def _assemble_final_table(igr_df, calls_df, marker_ids, ann_map,
@@ -1092,7 +1032,7 @@ def _assemble_final_table(igr_df, calls_df, marker_ids, ann_map,
         columns.append("sequence_5p_to_3p_cds")
     out = igr[columns].copy()
     out.rename(columns={"igr_id": "promoter_id"}, inplace=True)
-    return out
+    return _shortlist_order(out, prefix="motif_")
 
 
 def _load_annotation_map(annotations_tsv):
@@ -1473,14 +1413,6 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50,
                              max_len=None):
     """Build an inline SVG showing motif positions along a promoter sequence.
 
-    The promoter bar is drawn proportional to its actual length and
-    right-aligned: its 3' end (adjacent to the downstream CDS, where the
-    -10/-35 elements sit) is flush with the right margin, so the
-    gene-proximal ends line up across rows. ``max_len`` is the longest
-    promoter length in the displayed set and sets the shared
-    bp-to-pixel scale; when it is None or non-positive the bar fills the
-    full width (legacy behaviour).
-
     Returns an SVG string.
     """
     if seq_len == 0:
@@ -1553,27 +1485,21 @@ def step11_generate_report(cfg: Config, force: bool = False):
 
     print("── Generating HTML report ──")
 
-    candidates = []
-    if cfg.promoter_markers_verified.exists():
-        candidates.append(cfg.promoter_markers_verified)
-    if cfg.promoter_markers.exists():
-        candidates.append(cfg.promoter_markers)
-
+    # Only motif-verified marker promoters (step 8) are reported. The
+    # unverified marker list (step 7) is deliberately NOT used as a
+    # fallback: the report is headed "Verified marker promoters".
     promoter_df = None
-    for source_file in candidates:
+    if cfg.promoter_markers_verified.exists():
         try:
-            df = pd.read_csv(source_file, sep="\t")
+            df = pd.read_csv(cfg.promoter_markers_verified, sep="\t")
+            if "orientation" in df.columns:
+                promoter_df = df[df["orientation"].isin(["CO_F", "CO_R"])].copy()
         except pd.errors.EmptyDataError:
-            continue
-        if "orientation" not in df.columns:
-            continue
-        df = df[df["orientation"].isin(["CO_F", "CO_R"])].copy()
-        if not df.empty:
-            promoter_df = df
-            break
+            pass
 
     if promoter_df is None or promoter_df.empty:
-        print("  No verified promoter data available for report.")
+        print("  No verified marker promoters available for report "
+              "(run step 8 first, or the scan called none).")
         print("  Step 11 complete.\n")
         return
 
@@ -1612,32 +1538,10 @@ def step11_generate_report(cfg: Config, force: bool = False):
     has_motif_cols = "pos_10" in promoter_df.columns
 
     if has_motif_cols:
-        def _as_float(v):
-            try:
-                f = float(v)
-            except (TypeError, ValueError):
-                return None
-            return None if f != f else f  # NaN -> None
-
-        if "shortlist_score" in promoter_df.columns:
-            sort_col = "shortlist_score"
-        else:
-            sort_col = None
-            promoter_df = promoter_df.assign(
-                _path_rank=promoter_df["path"].map(
-                    lambda v: {"A": 0, "B": 1, "C": 2}.get(str(v).strip(), 3))
-            ).sort_values(by=["_path_rank"], ascending=True,
-                          kind="mergesort").drop(columns=["_path_rank"])
-
-        if sort_col is not None:
-            promoter_df = promoter_df.assign(
-                _rank_key=promoter_df[sort_col].map(
-                    lambda v: (_as_float(v) if _as_float(v) is not None
-                               else float("-inf"))),
-            )
-            promoter_df = promoter_df.sort_values(
-                by=["_rank_key"], ascending=False, kind="mergesort"
-            ).drop(columns=["_rank_key"])
+        promoter_df = _shortlist_order(promoter_df)
+    _ranked_by_score = bool(
+        has_motif_cols and "shortlist_score" in promoter_df.columns
+        and pd.to_numeric(promoter_df["shortlist_score"], errors="coerce").notna().any())
 
     n_promoters = len(promoter_df)
     n_annotated = sum(1 for _, r in promoter_df.iterrows()
@@ -1695,11 +1599,15 @@ def step11_generate_report(cfg: Config, force: bool = False):
         <span class="legend-item"><span class="legend-swatch" style="background:#ff8f00"></span>Extended &minus;10 (TG)</span>
     </div>
     <p style="font-size:0.8rem; color:#777; margin-bottom:16px;">
-        Showing the top 10 promoters by <code>shortlist_score</code>, a ranker fitted on 49
-        genomes and validated by leave-one-genome-out to put real promoters at the top of the
-        list: about 11 of the top 20 calls carry an annotated intergenic transcription start,
-        against about 9 under the ordering this replaces. The score orders calls &mdash; it is
-        not a calibrated probability that a given promoter will work in a construct.
+        """ + (
+        "Showing the top 10 promoters by <code>shortlist_score</code>, a ranker fitted on 49 "
+        "genomes and validated by leave-one-genome-out to put real promoters at the top of the "
+        "list: about 11 of the top 20 calls carry an annotated intergenic transcription start, "
+        "against about 9 under the ordering this replaces. The score orders calls &mdash; it is "
+        "not a calibrated probability that a given promoter will work in a construct."
+        if _ranked_by_score else
+        "Showing the top 10 promoters ordered by motif path (A&rarr;B&rarr;C) and then combined "
+        "&minus;log<sub>10</sub>(p); no ranker spec was available for <code>shortlist_score</code>.") + """
         Sequence diagrams are drawn
         proportional to promoter length and aligned on the 3' (gene-proximal) end.
     </p>
@@ -1718,7 +1626,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
                   if _has_ppv else
                   "Positive likelihood ratio (base-rate-free), from the held-out calibration."
                   if _has_lr else
-                  "Requires a bundled calibration (fit with calibrate_ppv.py); blank when uncalibrated.")
+                  "Requires a calibration JSON (--ppv-calibration); blank when uncalibrated.")
 
     # Table
     html_parts.append(f"""
@@ -1733,7 +1641,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
         <th>Motif path</th>
         <th>&minus;10</th>
         <th>&minus;35</th>
-        <th title="Length-standardised empirical score: best combined &minus;10/&minus;35 log-odds, standardised against the per-genome dinucleotide-shuffle null and normalised for the number of tested positions. The within-path sort key.">Score</th>
+        <th title="Length-standardised empirical score (score_std): best combined &minus;log10 empirical quantile of a &minus;10/&minus;35 pair over all spacer-linked positions, minus the shuffle-null location fitted on log(n_pairs). A ranker input, not the sort key.">Score</th>
         <th title="{html_mod.escape(_sig_title)}">{_sig_label}</th>
         <th>Spacer</th>
         <th>Associated CDS</th>
@@ -1775,8 +1683,11 @@ def step11_generate_report(cfg: Config, force: bool = False):
                     if has_ext10_flag:
                         motif_hits.append({
                             "motif_id": "ext-10 (TG)",
-                            "start": p10 - 1,  # TG is 2 nt before -10
-                            "stop": p10,
+                            # TGn: TG occupies 0-based p10-3, p10-2
+                            # (1-based p10-2, p10-1), one base 5' of
+                            # the hexamer.
+                            "start": p10 - 2,
+                            "stop": p10 - 1,
                             "motif_database": "ext10",
                         })
                 except (ValueError, TypeError):
@@ -1984,7 +1895,7 @@ _REPORT_HTML_HEAD = """<!DOCTYPE html>
 
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
     Domain: <strong>{domain_label}</strong> · Verification: <strong>&minus;10/&minus;35 motif scan</strong><br/>
-    This table lists the <strong>top {n_shown}</strong> of {n_marker_promoters} marker-filtered promoters confirmed by &minus;10/&minus;35 motif scanning, ranked by motif path (A&rarr;B&rarr;C) then combined &minus;log<sub>10</sub>(p).
+    This table lists the <strong>top {n_shown}</strong> of {n_marker_promoters} marker-filtered promoters confirmed by &minus;10/&minus;35 motif scanning, ordered by <code>shortlist_score</code> (see note below the legend).
     A total of {n_all_promoters} promoter-orientation IGRs were identified in the genome.
 </p>
 <p style="font-size:0.85rem; color:#555; margin-bottom:20px;">
@@ -2192,9 +2103,11 @@ def step10_final_table(cfg: Config, force: bool = False):
         igr = _add_cds_column(igr, contigs, cfg.cds_bp)
         columns.append("sequence_5p_to_3p_cds")
 
-    # 8. Select and order final columns
+    # 8. Select and order final columns; rows ordered by shortlist_score
+    #    (called IGRs first), see _shortlist_order.
     out = igr[columns].copy()
     out.rename(columns={"igr_id": "promoter_id"}, inplace=True)
+    out = _shortlist_order(out, prefix="motif_")
 
     out.to_csv(cfg.final_table, sep="\t", index=False)
     print(f"  Final table ({len(out)} rows) -> {cfg.final_table}")
@@ -2478,7 +2391,7 @@ def _run_pipeline(cfg, args):
                 func(cfg, force=args.force)
         modes = tuple(m.strip() for m in args.sweep_modes.split(",") if m.strip())
         print(f"\n{'=' * 60}")
-        print(f"  DIAGNOSTIC: -10 / -35 p-value sweep")
+        print("  DIAGNOSTIC: -10 / -35 p-value sweep")
         print(f"{'=' * 60}\n")
         diagnose_p_sweep(
             cfg,
@@ -2499,14 +2412,25 @@ def _run_pipeline(cfg, args):
             func(cfg, force=args.force)
 
 
+def _batch_cell(row, key):
+    """Return a batch-table cell as a stripped string; empty cells (pandas
+    NaN / None / blank) become "" so an unfilled optional column is treated
+    as absent rather than as the literal path "nan"."""
+    v = row.get(key, "")
+    if v is None or (isinstance(v, float) and v != v):
+        return ""
+    v = str(v).strip()
+    return "" if v.lower() in ("", "nan", "none") else v
+
+
 def _link_prokka_files(cfg, row):
     """Symlink user-supplied Prokka files into the expected output layout.
 
     Returns the step number to start from: 2 if Prokka files were linked
     (skip step 1), or 1 if they were not provided.
     """
-    gff_path = row.get("gff", "")
-    faa_path = row.get("faa", "")
+    gff_path = _batch_cell(row, "gff")
+    faa_path = _batch_cell(row, "faa")
 
     if not gff_path or not faa_path:
         return 1  # no Prokka files supplied — run step 1 normally
@@ -2532,7 +2456,7 @@ def _link_prokka_files(cfg, row):
         dest.symlink_to(src)
 
     # Optional: FNA (nucleotide FASTA from Prokka)
-    fna_path = row.get("fna", "")
+    fna_path = _batch_cell(row, "fna")
     if fna_path:
         fna_src = Path(str(fna_path)).resolve()
         if fna_src.exists():
@@ -2557,8 +2481,11 @@ def _run_batch(args, kingdom):
     print(f"Batch mode: {n_samples} sample(s) from {args.batch}\n")
 
     for idx, row in batch_df.iterrows():
-        sample_id = str(row["sample_id"])
-        fasta_path = Path(str(row["fasta"])).resolve()
+        sample_id = _batch_cell(row, "sample_id")
+        fasta_cell = _batch_cell(row, "fasta")
+        if not sample_id or not fasta_cell:
+            sys.exit(f"Batch table row {idx + 1}: sample_id and fasta are required")
+        fasta_path = Path(fasta_cell).resolve()
 
         if not fasta_path.exists():
             sys.exit(f"FASTA not found for sample '{sample_id}': {fasta_path}")

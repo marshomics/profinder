@@ -5,24 +5,49 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 
 _SPEC_PATH = Path(__file__).resolve().parent / "promoter_ranker.json"
 _SPEC = None
+_FEATURE_NAMES = ("neg_log_p10", "neg_log_p35_raw", "score_std", "spacer", "n_pairs",
+                  "gc", "igr_len", "dist_to_cds", "m10_rank", "m35_rank",
+                  "is_pathA", "is_pathB", "ext10", "is_co_r")
 
 
-def spec() -> dict:
-    """Load and cache the shipped ranker definition."""
-    global _SPEC
+_WARNED = False
+
+
+def spec():
+    """Load and cache the shipped ranker definition (``promoter_ranker.json``
+    next to this module)"""
+    global _SPEC, _WARNED
     if _SPEC is None:
+        if not _SPEC_PATH.is_file():
+            if not _WARNED:
+                print(f"  WARNING: ranker spec not found at {_SPEC_PATH}; "
+                      f"shortlist_score will be blank and tables fall back to "
+                      f"path-then-significance ordering.", file=sys.stderr)
+                _WARNED = True
+            return None
         with open(_SPEC_PATH, encoding="utf-8") as fh:
-            _SPEC = json.load(fh)
-        n = len(_SPEC["features"])
-        if not (len(_SPEC["coef"]) == len(_SPEC["median_impute"]) == n):
+            loaded = json.load(fh)
+        n = len(loaded["features"])
+        if not (len(loaded["coef"]) == len(loaded["median_impute"]) == n):
             raise ValueError(f"ranker spec inconsistent: {n} features, "
-                             f"{len(_SPEC['coef'])} coefficients, "
-                             f"{len(_SPEC['median_impute'])} medians")
+                             f"{len(loaded['coef'])} coefficients, "
+                             f"{len(loaded['median_impute'])} medians")
+        unknown = set(loaded["features"]) - set(_FEATURE_NAMES)
+        if unknown:
+            raise ValueError(f"ranker spec names features this module does not "
+                             f"compute: {sorted(unknown)}")
+        _SPEC = loaded
     return _SPEC
+
+
+def available() -> bool:
+    """True when a ranker spec is loadable."""
+    return spec() is not None
 
 
 def _m_rank(v):
@@ -103,6 +128,8 @@ def score(rec, seq) -> float:
     to the fitted training median for that feature, so a call is never dropped from the ranking
     for want of one value."""
     sp = spec()
+    if sp is None:
+        return float("nan")
     f = features(rec, seq)
     z = float(sp["intercept"])
     for name, w, med in zip(sp["features"], sp["coef"], sp["median_impute"]):
