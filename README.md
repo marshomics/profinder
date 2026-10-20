@@ -4,14 +4,6 @@
 
 ProFinder extracts high-confidence constitutive promoter candidates from a single bacterial or archaeal genome assembly. Given a FASTA file, it returns a curated shortlist of promoter sequences upstream of conserved single-copy housekeeping genes, oriented 5'→3' and ready for use in expression constructs, reporter systems, or metabolic engineering.
 
-> [!WARNING]
-> **Maintenance in progress**
->
-> This repository is currently being updated, and the ProFinder web server is under maintenance.
-> New job submissions are paused until maintenance is complete. Jobs that were already submitted stay in the queue and will be processed afterwards.
->
-> Expected to be back by **21 October 2026, 18:00 (Europe/Berlin)**.
-> Thank you for your patience.
 
 ## Access the server
 
@@ -22,7 +14,7 @@ ProFinder extracts high-confidence constitutive promoter candidates from a singl
 
 ProFinder applies a series of biologically motivated filters to find promoters upstream of single-copy phylogenetic marker genes that are conserved across diverse bacteria and archaea: ribosomal proteins, tRNA synthetases, RNA polymerase subunits, DNA replication and repair components, translation factors, and similar housekeeping functions. Because these genes are usually constitutively and highly expressed, their promoters are desirable for broad microbial genetic system applications.
 
-The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka) (run with `--rfam`, so non-coding RNA features bound intergenic regions), extracts intergenic regions (IGRs) between annotated features, identifies operons with a two-pass proximity / flanking-distance algorithm, and screens for marker genes via `hmmsearch` against 98 bundled HMM profiles. Candidate promoters are then verified by scanning for −10 and −35 hexamer motifs with a 16–18 bp spacer, using position weight matrices scored against the composition of the genome being scanned. Significance is established empirically against a per-genome dinucleotide-shuffle null, and each call carries a length-standardised score plus - when a held-out calibration is supplied - a calibrated positive-predictive value. A final results table and an HTML report are produced.
+The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka) (run with `--rfam`, so non-coding RNA features bound intergenic regions), extracts intergenic regions (IGRs) between annotated features, identifies operons with a two-pass proximity / flanking-distance algorithm, and screens for marker genes via `hmmsearch` against 98 bundled HMM profiles. Candidate promoters are then verified by scanning for −10 and −35 hexamer motifs with a 16–18 bp spacer, using position weight matrices scored against the composition of the genome being scanned. Significance is established empirically against a per-genome dinucleotide-shuffle null; each call carries a length-standardised score, a shortlist ranking score, and - when a held-out calibration is supplied - a calibrated positive-predictive value. A final results table and an HTML report are produced.
 
 ProFinder reports two promoter sets from every run: a genome-wide catalogue of every motif-confirmed promoter-orientation IGR, and the marker-gene-constrained subset. The marker subset is the main deliverable.
 
@@ -31,7 +23,7 @@ ProFinder reports two promoter sets from every run: a genome-wide catalogue of e
 
 ProFinder needs Python ≥ 3.9, [Prokka](https://github.com/tseemann/prokka), and [HMMER](http://hmmer.org/) (specifically `hmmsearch`). The −10/−35 scan reads MEME-format motif files directly in Python, so the MEME suite is **not** required. HMM profiles and the motif file are bundled with the package.
 
-Python dependencies: `pandas ≥ 1.3`, `numpy ≥ 1.20`, `biopython ≥ 1.79`. `scipy` is optional (used only for an optional generalised-Pareto tail refinement in the empirical null). `matplotlib` is optional and only used to render the figure in the p-value-sweep diagnostic.
+Python dependencies: `pandas ≥ 1.3`, `numpy ≥ 1.20`, `biopython ≥ 1.79` (listed in `pyproject.toml` and `requirements.txt`). `scipy` is optional (used only for an optional generalised-Pareto tail refinement in the empirical null). `matplotlib` is optional and only used to render the figure in the p-value-sweep diagnostic.
 
 
 ## Installation
@@ -154,7 +146,7 @@ Each intergenic region is classified by the strand orientation of its flanking g
 
 **CONV** (→ IGR ←): genes point toward each other. Sits between two stop codons and does not carry a promoter for either flanking gene.
 
-Tandem+ and Tandem- are the **promoter-orientation** IGRs carried into the motif scan and the final table; DP and CONV are excluded from those outputs. Boundary features used to define IGRs include CDS and all Prokka `--rfam` non-coding RNA classes (tRNA, rRNA, tmRNA, ncRNA, misc_RNA), and any window overlapping an annotated feature is rejected, so IGRs never sit inside or across a non-coding gene. An IGR is kept only when its downstream (promoter-target) gene is a CDS, rRNA, or tRNA — the classes that carry strong constitutive promoters (rRNA and tRNA operons include the rrn P1/P2 promoters). An IGR that would only drive a tmRNA, ncRNA, or misc_RNA is dropped, while those features still serve as boundaries for neighbouring IGRs. Only IGRs of length 81–1000 bp (configurable) are kept.
+Tandem+ and Tandem- are the **promoter-orientation** IGRs carried into the motif scan and the final table; DP and CONV are excluded from those outputs. In the output tables and FASTA headers these four classes appear under their internal labels `CO_F` (tandem+), `CO_R` (tandem-), `DP` and `CONV`. Boundary features used to define IGRs include CDS and all Prokka `--rfam` non-coding RNA classes (tRNA, rRNA, tmRNA, ncRNA, misc_RNA), and any window overlapping an annotated feature is rejected, so IGRs never sit inside or across a non-coding gene. An IGR is kept only when its downstream (promoter-target) gene is a CDS, rRNA, or tRNA — the classes that carry strong constitutive promoters (rRNA and tRNA operons include the rrn P1/P2 promoters). An IGR that would only drive a tmRNA, ncRNA, or misc_RNA is dropped, while those features still serve as boundaries for neighbouring IGRs. Only IGRs of length 81–1000 bp (configurable) are kept.
 
 ## Motif-based promoter verification
 
@@ -166,21 +158,23 @@ Step 8 verifies candidate promoters by scanning for the −10 and −35 hexamer 
 
 **Orientation-aware scanning.** Tandem+ / Tandem- IGRs are scanned on the + strand of the already-oriented sequence only, because a − strand motif would describe a promoter pointing away from the downstream marker gene. DP IGRs would be scanned on both strands.
 
-**Distance-to-CDS cutoff.** A −10 hit whose right edge sits more than `--max-dist-to-cds-start` bp (default 200) from the downstream CDS start is dropped before the spacer search. This captures the bulk of literature σ⁷⁰ leader lengths while removing distal motifs in long IGRs that are unlikely to drive the downstream gene.
+**Distance-to-CDS cutoff.** A −10 hit whose right edge sits more than `--max-dist-to-cds-start` bp (default 300) from the downstream CDS start is dropped before the spacer search. This captures the bulk of literature σ⁷⁰ leader lengths while removing distal motifs in long IGRs that are unlikely to drive the downstream gene.
 
 **Recognition paths.** Each surviving −10 hit is classified into one of three paths, in priority order. Paths A–C require a −35 hit with a 16–18 bp spacer (canonical σ⁷⁰ spacer is 17 ± 1 bp):
 
 **Path A** — a strict −35 from the *same* subgroup as the −10 (linked pair).
-**Path B** — an extended −10 (a TG dinucleotide immediately upstream, accepted at either the −2/−1 or −3/−2 position of the −10 hexamer) plus a *relaxed* −35 from the same subgroup.
+**Path B** — an extended −10 (the canonical "TGn" motif: a TG dinucleotide one base 5' of the hexamer, i.e. TSS positions −15/−14 for a hexamer at −12..−7) plus a *relaxed* −35 from the same subgroup.
 **Path C** — a strict −35 from a *different* subgroup (unlinked).
 
-Default element thresholds (as null quantiles): `--p10` 1e-3 for −10 hits, `--p35` 1e-3 for strict −35 hits (paths A and C), `--p35-relaxed` 3e-2 for the relaxed −35 used only in path B.
+Default element thresholds (as null quantiles): `--p10` 1e-2 for −10 hits, `--p35` 1e-3 for strict −35 hits (paths A and C), `--p35-relaxed` 3e-2 for the relaxed −35 used only in path B. The CLI reads these defaults from `profinder/config.py`, so `profinder --help` always shows the values actually applied.
 
-When several subgroups exceed threshold at one position, the most significant (lowest empirical quantile) is reported, with raw log-odds as the tiebreaker. The single best hit per IGR is chosen by path rank (A > B > C), then by combined element significance −log₁₀(emp_p₁₀) + −log₁₀(emp_p₃₅).
+When several subgroups exceed threshold at one position, the most significant (lowest empirical quantile) is reported, with raw log-odds as the tiebreaker. Path A is tested directly on the −10's own subgroup (does *that* subgroup have a strict −35 at the spacer-linked site), so a linked pair is never demoted to path C merely because a different subgroup scores marginally higher at the same −35 site. The single best hit per IGR is chosen by path rank (A > B > C), then by combined element significance −log₁₀(emp_p₁₀) + −log₁₀(emp_p₃₅). For path C, emp_p₃₅ is Šidák-adjusted for the number of other subgroups searched (`motif_p35_multiplicity_k`); the raw value is kept in `motif_emp_p_35_uncorrected`.
 
-**Per-call score and calibrated confidence.** Each call also gets a single **length-standardised score** (`score_std`): the best combined −10/−35 log-odds over the interval, standardised against the per-genome shuffle null and normalised for the number of tested positions by fitting the null's location on log(n_positions) (a longer interval offers more chances for a high score; this removes that length dependence without the over-correction a closed-form Šidák bound would impose). `score_std` is the primary ranking quantity and the input to calibration.
+**Per-call score, shortlist ranking and calibrated confidence.** Each call also gets a single **length-standardised score** (`score_std`): the best combined −log₁₀ empirical quantile of a spacer-linked −10/−35 pair over the interval, minus the shuffle null's location fitted on log(n_pairs) (a longer interval offers more chances for a high score; this removes that length dependence without the over-correction a closed-form Šidák bound would impose). `score_std` is the threshold statistic and the calibration input, but it is **not** the ranking quantity: on the 49-genome panel, sorting on it alone ranked calls no better than chance.
 
-A calibration fitted on **held-out genomes** (fit with `python -m profinder.calibrate_ppv`) maps `(path, score_std)` to two reported quantities:
+Ranking uses `shortlist_score` (0–1, higher first), a logistic ranker over the call's features (element significances, `score_std`, spacer, n_pairs, GC, IGR length, distance to CDS, subgroup ranks, path, extended −10, orientation) fitted on 49 genomes against "interval contains an annotated intergenic TSS" and validated leave-one-genome-out (see `profinder/ranker.py`; coefficients ship in `profinder/promoter_ranker.json`). `profinder_results.tsv`, the per-sweep tables and the HTML report are all ordered by it (called IGRs first, uncalled IGRs after in genomic order). Its order is validated; its value is not a calibrated probability. If the ranker spec is missing, `shortlist_score` is blank and the tables fall back to path rank then combined significance.
+
+A calibration fitted on **held-out genomes** (a `Calibration` JSON written by `profinder.empirical.Calibration.fit(...).to_json(...)`; no calibration is bundled by default, and the fitting script is not part of this package) maps `(path, score_std)` to two reported quantities:
 
 - `lr_pos` — the **positive likelihood ratio**, base-rate-free, so it does not assume a promoter prevalence.
 - `ppv_interval` — the probability that the **interval carries a promoter** (not that the reported coordinates are exactly the promoter), derived from `lr_pos` only against an explicitly stated prevalence prior (`--prior`).
@@ -255,18 +249,18 @@ Motif scanning:
                            subgroup motifs
                            (default: bundled all_unique_subgroups.meme)
   --p10 F                  −10 element threshold, as a null quantile
-                           (default: 1e-3)
+                           (default: 1e-2)
   --p35 F                  Strict −35 threshold, paths A and C
                            (default: 1e-3)
   --p35-relaxed F          Relaxed −35 threshold, path B only
                            (default: 3e-2)
   --max-dist-to-cds-start N
                            Max bp from the −10 right edge to the downstream
-                           CDS start; farther hits are dropped (default: 200)
+                           CDS start; farther hits are dropped (default: 300)
   --n-shuffles N           Dinucleotide-preserving shuffles per interval for
                            the per-genome empirical null (default: 10)
-  --ppv-calibration FILE   Per-path PPV/LR+ calibration JSON (see
-                           calibrate_ppv.py). Default: bundled if present,
+  --ppv-calibration FILE   Per-path PPV/LR+ calibration JSON (a
+                           Calibration.to_json file). Default: bundled if present,
                            else uncalibrated (lr_pos / ppv_interval blank)
   --prior F                Promoter-prevalence prior used to turn lr_pos into
                            ppv_interval. Omit to report lr_pos only
@@ -321,9 +315,7 @@ output/
 │   ├── promoter_markers.tsv             # marker promoters (one row per IGR)
 │   └── promoter_markers_hmm.tsv         # marker promoters × HMM profiles
 ├── motifs/                              # Motif scan
-│   ├── motif_hits_all.tsv               # all motif hits, all IGRs
 │   ├── motif_best_all.tsv               # best motif hit per IGR (all)
-│   ├── motif_hits_markers.tsv           # all motif hits, marker IGRs
 │   ├── motif_best_markers.tsv           # best motif hit per IGR (markers)
 │   └── promoter_markers_verified.tsv    # motif-confirmed marker promoters
 ├── all_promoters_verified.fasta         # motif-confirmed promoters, all (5'→3')
@@ -333,11 +325,11 @@ output/
 └── promoter_report.html                 # visual HTML report (top 10 promoters)
 ```
 
-The HTML report lists the top 10 marker promoters, ranked by motif path (A→B→C) then combined −log₁₀(p). Each promoter's sequence diagram is drawn proportional to its actual length and aligned on the 3' (gene-proximal) end, so the −10/−35 elements line up across rows.
+The HTML report lists the top 10 motif-verified marker promoters, ordered by `shortlist_score` (fallback: motif path A→B→C then combined −log₁₀(p) when no ranker spec is available). Each promoter's sequence diagram is drawn proportional to its actual length and aligned on the 3' (gene-proximal) end, so the −10/−35 elements line up across rows.
 
 In `--diagnose-p-sweep` mode, steps 8, 10, and 11 are replaced by a `diagnostics/` directory (see Diagnostic mode above).
 
-Tandem- FASTA records are reverse-complemented so every sequence is oriented 5'→3'. The `profinder_results.tsv` table contains one row per promoter-orientation IGR, with these columns:
+Tandem- FASTA records are reverse-complemented so every sequence is oriented 5'→3'. The `profinder_results.tsv` table contains one row per promoter-orientation IGR (motif-confirmed rows first, ordered by `motif_shortlist_score` descending; unconfirmed rows follow in genomic order), with these columns:
 
 ```
 promoter_id, contig, start, end, length, orientation,
@@ -364,6 +356,7 @@ calibration is supplied via --ppv-calibration.)
 ```
 profinder/
 ├── all_unique_subgroups.meme    # 72 paired M###_m10 / M###_m35 motif subgroups
+├── promoter_ranker.json          # fitted shortlist ranker (required by ranker.py)
 ├── hmms/                         # 98 single-copy marker-gene HMM profiles
 │   ├── Ribosomal_L20_8b522e5f.hmm
 │   ├── RNA_pol_A_bac_5767a6d9.hmm
@@ -375,7 +368,71 @@ profinder/
 
 The HMM set spans ribosomal proteins, tRNA synthetases, RNA polymerase subunits, DNA replication and repair, cell division, and translation factors — single-copy genes conserved across the bacterial and archaeal tree. By default ProFinder reads the motif file from the package root; `profinder/motifs/` holds an identical copy.
 
+The profile HMMs and motif matrices are **derived from third-party sources** and are not covered by ProFinder's own licence — see [Bundled data provenance](#bundled-data-provenance).
+
+
+## Citation
+
+If you use ProFinder, please cite both the software release and the paper.
+
+**Software** (this release, archived on Zenodo):
+
+> Gautam, A. and Marsh, J.W. ProFinder (version 0.1.0). Zenodo. doi:10.5281/zenodo.XXXXXXX
+
+**Paper:**
+
+> Gautam, A. and Marsh, J.W. ProFinder: candidate constitutive promoter prediction across the
+> bacterial tree for genetic tool development in non-model species. *Nucleic Acids Research*
+> (submitted).
+
 
 ## License
 
-MIT
+### Software
+
+ProFinder's source code is released under the [MIT License](LICENSE), © 2026 James Marsh.
+
+### Bundled data provenance
+
+The package ships model files that ProFinder redistributes rather than authors. **These are not
+covered by the MIT licence above.** Each retains the terms of its original distribution, and anyone
+redistributing ProFinder — or reusing these files independently — should check those terms at the
+source.
+
+| Bundled file | What it is | Origin |
+|---|---|---|
+| `profinder/hmms/*.hmm` | 98 profile HMMs, one representative per marker family | Pfam and TIGRFAM profile HMMs, plus unaccessioned models from the marker sets below. The 98 families comprise 187 constituent profiles, of which 60 carry TIGRFAM accessions and 20 carry Pfam accessions. |
+| `all_unique_subgroups.meme` (and the copy under `profinder/motifs/`) | 72 paired −10 / −35 position weight matrices | Fitted here from the experimentally mapped TSS and promoter compilation of Kuo et al. (2025), *Nucleic Acids Research* 53:gkaf1310 |
+| `profinder/promoter_ranker.json` | Fitted logistic shortlist ranker | Original to this work; covered by the MIT licence |
+
+Marker-family membership was determined across ten published single-copy marker-gene sets. The
+bundled selection draws on all ten:
+
+| Set | Genes | Reference |
+|---|---|---|
+| Cic31 | 31 | Ciccarelli et al. (2006) |
+| Cre40 | 40 | Creevey et al. (2011) |
+| Dup107 | 107 | Dupont et al. (2012) |
+| PhyEco | 114 | Wu et al. (2013) |
+| Aln36 | 36 | Alneberg et al. (2014), CONCOCT |
+| Lan73 | 73 | Lan et al. (2016) |
+| bac120 | 120 | Parks et al. (2017), GTDB |
+| Col61 | 61 | Coleman et al. (2021) |
+| UBCG2 | 81 | Kim et al. (2021) |
+| Tia85 | 85 | Tian and Imanian (2023) |
+
+Pfam and TIGRFAM models are distributed through [InterPro](https://www.ebi.ac.uk/interpro/)
+(EMBL-EBI). GTDB releases its data under CC BY-SA 4.0 and its software under GPL-3.0
+([gtdb.ecogenomic.org/licenses](https://gtdb.ecogenomic.org/licenses)). `bac120` contributed
+marker-set membership to the family selection here; the profile HMMs bundled under `hmms/` are
+Pfam and TIGRFAM models, not GTDB's. ProFinder neither uses nor redistributes GTDB software, so
+the GPL-3.0 terms do not reach it. If you redistribute the bundled `hmms/` directory, keep this
+section with it.
+
+### External tools
+
+ProFinder invokes [Prokka](https://github.com/tseemann/prokka) (GPL-3.0) and
+[HMMER](http://hmmer.org/) (BSD-3-Clause) as external programs. It neither links against nor
+redistributes them, so their licences do not extend to ProFinder; install them separately and
+observe their terms. The MEME suite is not required — MEME-format motif files are parsed directly
+in Python.
