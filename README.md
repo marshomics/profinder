@@ -375,15 +375,9 @@ The profile HMMs and motif matrices are **derived from third-party sources** and
 
 If you use ProFinder, please cite both the software release and the paper.
 
-**Software** (this release, archived on Zenodo):
-
-> Gautam, A. and Marsh, J.W. ProFinder (version 0.1.0). Zenodo. doi:10.5281/zenodo.XXXXXXX
-
-**Paper:**
-
 > Gautam, A. and Marsh, J.W. ProFinder: candidate constitutive promoter prediction across the
 > bacterial tree for genetic tool development in non-model species. *Nucleic Acids Research*
-> (submitted).
+> (in press).
 
 
 ## License
