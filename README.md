@@ -13,7 +13,7 @@ ProFinder extracts high-confidence constitutive promoter candidates from a singl
 
 ProFinder applies a series of biologically motivated filters to find promoters upstream of single-copy phylogenetic marker genes that are conserved across diverse bacteria and archaea: ribosomal proteins, tRNA synthetases, RNA polymerase subunits, DNA replication and repair components, translation factors, and similar housekeeping functions. Because these genes are usually constitutively and highly expressed, their promoters are desirable for broad microbial genetic system applications.
 
-The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka) (run with `--rfam`, so non-coding RNA features bound intergenic regions), extracts intergenic regions (IGRs) between annotated features, identifies operons with a two-pass proximity / flanking-distance algorithm, and screens for marker genes via `hmmsearch` against 98 bundled HMM profiles. Candidate promoters are then verified by scanning for −10 and −35 hexamer motifs with a 16–18 bp spacer, using position weight matrices scored against the composition of the genome being scanned. Significance is established empirically against a per-genome dinucleotide-shuffle null; each call carries a length-standardised score, a shortlist ranking score, and - when a held-out calibration is supplied - a calibrated positive-predictive value. A final results table and an HTML report are produced.
+The pipeline annotates a genome with [Prokka](https://github.com/tseemann/prokka) (run with `--rfam`, so non-coding RNA features bound intergenic regions), extracts intergenic regions (IGRs) between annotated features, groups genes into operons (runs of same-strand genes; see Operons), and screens for marker genes via `hmmsearch` against 98 bundled HMM profiles. Candidate promoters are then verified by scanning for −10 and −35 hexamer motifs with a 16–18 bp spacer, using position weight matrices scored against the composition of the genome being scanned. Significance is established empirically against a per-genome dinucleotide-shuffle null; each call carries a length-standardised score, a shortlist ranking score, and - when a held-out calibration is supplied - a calibrated positive-predictive value. A final results table and an HTML report are produced.
 
 ProFinder reports two promoter sets from every run: a genome-wide catalogue of every motif-confirmed promoter-orientation IGR, and the marker-gene-constrained subset. The marker subset is the main deliverable.
 
@@ -111,7 +111,7 @@ Batch mode (multiple genomes from a TSV table):
 profinder --batch samples.tsv -o results/
 ```
 
-The pipeline checkpoints at each step. Re-running the same command skips completed steps. Use `--force` to re-run everything.
+The pipeline checkpoints at each step. Re-running the same command skips completed steps. The operon and marker steps (3, 6, 7, the marker shortlist of step 8, 10, 11 and the p-value sweep) also record their input files and settings in `.profinder_state.json` in the output directory and are rebuilt when either has changed, for example after a new `--min-flanking-dist` or an upgrade of ProFinder; the genome-wide motif scan is not repeated for this. Use `--force` to re-run everything.
 
 **Input.** A nucleotide genome FASTA (optionally gzipped) with unique contig IDs. Contig IDs longer than Prokka's 37-character limit are shortened for Prokka and restored in every ProFinder output; `prokka/contig_id_map.tsv` records the mapping. ProFinder stops with a message naming the problem, before any annotation, on an empty, protein or duplicate-ID FASTA; it also stops when a step's inputs are missing (for example `--start 8` in a directory where steps 1–7 never ran) or when `hmmsearch` cannot run, rather than writing empty or unscreened results.
 
@@ -128,13 +128,13 @@ The pipeline checkpoints at each step. Re-running the same command skips complet
 | 4 | Run hmmsearch (98 profiles) | `hmm/tblout/*.tblout` |
 | 5 | Filter HMM output | `hmm/hmm_filtered.tsv` |
 | 6 | Filter operons + add markers | `operons/operons_filtered_markers.tsv` |
-| 7 | Match IGRs to marker operons | `operons/promoter_markers.tsv`, `operons/promoter_markers_hmm.tsv` |
+| 7 | Match IGRs to marker operons | `operons/promoter_markers.tsv`, `operons/promoter_markers_hmm.tsv`, `operons/marker_best_hits.tsv` |
 | 8 | Scan promoter motifs (−10/−35, paths A–C) | `motifs/motif_best_all.tsv`, `motifs/promoter_markers_verified.tsv`, `all_promoters_verified.fasta`, `marker_promoters_verified.fasta` |
 | 9 | Annotate CDS (Prokka) | `cds_annotations.tsv` |
-| 10 | Build final output table | `profinder_results.tsv` |
+| 10 | Build final output table | `profinder_results.tsv`, `marker_summary.tsv` |
 | 11 | Generate HTML report | `promoter_report.html` |
 
-Step 8 scans two sets independently against the same calibrated motifs. First, all promoter-orientation IGRs (tandem+ / tandem-) are screened for −10/−35 combinations, producing a genome-wide catalogue of motif-confirmed promoters regardless of marker status. Second, the marker-filtered subset (from step 7) is scanned, producing verified marker promoters with motif details merged onto the original metadata.
+Step 8 scans all promoter-orientation IGRs (tandem+ / tandem-) once against the calibrated motifs, producing a genome-wide catalogue of motif-confirmed promoters regardless of marker status. The verified marker promoters are the calls that fall in marker regions (step 7); they carry their marker evidence (see Marker evidence and shortlist order).
 
 
 ## IGR orientation logic
@@ -150,6 +150,23 @@ Each intergenic region is classified by the strand orientation of its flanking g
 **CONV** (→ IGR ←): genes point toward each other. Sits between two stop codons and does not carry a promoter for either flanking gene.
 
 Tandem+ and Tandem- are the **promoter-orientation** IGRs carried into the motif scan and the final table; DP and CONV are excluded from those outputs. In the output tables and FASTA headers these four classes appear under their internal labels `CO_F` (tandem+), `CO_R` (tandem-), `DP` and `CONV`. Boundary features used to define IGRs include CDS and all Prokka `--rfam` non-coding RNA classes (tRNA, rRNA, tmRNA, ncRNA, misc_RNA), and any window overlapping an annotated feature is rejected, so IGRs never sit inside or across a non-coding gene. An IGR is kept only when its downstream (promoter-target) gene is a CDS, rRNA, or tRNA — the classes that carry strong constitutive promoters (rRNA and tRNA operons include the rrn P1/P2 promoters). An IGR that would only drive a tmRNA, ncRNA, or misc_RNA is dropped, while those features still serve as boundaries for neighbouring IGRs. Only IGRs of length 81–1000 bp (configurable) are kept.
+
+## Operons
+
+Step 3 groups consecutive CDS on the same strand whose gap is at most `--max-internal-dist` (default 25 bp) into a run; a change of strand always ends a run, however close the genes are. A run is kept as an operon unless a gene on the same strand lies less than `--min-flanking-dist` (default 75 bp) upstream of its first gene in the direction of transcription, because the run may then continue an operon that starts further upstream. An opposite-strand neighbour or a contig end marks an unambiguous start, and the gap after the last gene is not tested: it bounds the operon's 3′ end, not its promoter. `operons/operons.tsv` lists every operon gene with its `Strand`, and `FirstGene` marks the first gene in the direction of transcription (`yes_1` on the + strand, `yes_2` on the − strand). A gene outside every operon cannot be linked to a marker region; `marker_summary.tsv` names the rule that excluded each profile's best gene.
+
+## Marker evidence and shortlist order
+
+An HMM hit at or above `--hmm-bitscore` (default 25 bits) marks a gene as a marker candidate, but each profile's best-scoring gene is the likeliest true single-copy marker; lower-scoring hits are mostly paralogs. Step 7 records the best-scoring gene of every profile (`operons/marker_best_hits.tsv`; tied genes are all kept) and labels each marker region by the strongest marker gene it can drive. A region drives the gene immediately downstream of it in the direction of transcription and every later gene of the same operon, so a region that lies downstream of all of an operon's hit genes is not a marker region.
+
+| Label | The region drives |
+|---|---|
+| `best_match` | a gene that is some profile's best-scoring hit |
+| `best_match_via_operon` | a later gene of the same operon that is some profile's best-scoring hit |
+| `weaker_match` | a gene with only lower-scoring hits |
+| `weaker_match_via_operon` | a later gene of the same operon with only lower-scoring hits |
+
+Every marker region is kept. The marker shortlist (`motifs/promoter_markers_verified.tsv`, `marker_promoters_verified.fasta` and the HTML report) lists the motif-confirmed marker regions in the label order above, and by `shortlist_score` within each label. The final table carries the label (`marker_evidence`), the hit gene it refers to (`marker_gene`) and that gene's profiles (`marker_profiles`). `marker_summary.tsv` has one row per marker profile: its best-scoring gene, the runner-up and the margin in bits, the nearest promoter-orientation region upstream of that gene in its operon, that region's call, and a note when no region was scanned (for example, a divergent upstream region, or a best gene that the operon rule leaves outside every operon).
 
 ## Motif-based promoter verification
 
@@ -279,8 +296,10 @@ Parameters:
   --prefix STR             Prokka output prefix (default: genome)
   --igr-min N              Minimum IGR length in bp (default: 81)
   --igr-max N              Maximum IGR length in bp (default: 1000)
-  --max-internal-dist N    Max gap within an operon in bp (default: 25)
-  --min-flanking-dist N    Min gap at operon boundaries in bp (default: 75)
+  --max-internal-dist N    Max gap between same-strand genes of an operon
+                           in bp (default: 25)
+  --min-flanking-dist N    Min gap to a same-strand gene upstream of an
+                           operon in bp (default: 75)
   --hmm-bitscore F         Minimum HMM bitscore (default: 25.0)
   --cds-bp N               Append first N nt of downstream CDS to the final
                            table sequence column (default: 0, disabled)
@@ -312,32 +331,36 @@ output/
 │   ├── hmm_combined.tsv
 │   └── hmm_filtered.tsv
 ├── operons/                             # Operon identification + marker matching
-│   ├── operons.tsv
+│   ├── operons.tsv                      # operon genes with strand and first-gene label
 │   ├── operons_filtered.tsv
 │   ├── operons_filtered_markers.tsv
-│   ├── promoter_markers.tsv             # marker promoters (one row per IGR)
-│   └── promoter_markers_hmm.tsv         # marker promoters × HMM profiles
+│   ├── promoter_markers.tsv             # marker regions with marker evidence (one row per IGR)
+│   ├── promoter_markers_hmm.tsv         # marker regions × HMM profiles of the driven gene
+│   └── marker_best_hits.tsv             # best-scoring gene per HMM profile
 ├── motifs/                              # Motif scan
 │   ├── motif_best_all.tsv               # best motif hit per IGR (all)
 │   ├── motif_best_markers.tsv           # best motif hit per IGR (markers)
 │   └── promoter_markers_verified.tsv    # motif-confirmed marker promoters
-├── all_promoters_verified.fasta         # motif-confirmed promoters, all (5'→3')
-├── marker_promoters_verified.fasta      # motif-confirmed marker promoters (5'→3')
+├── .profinder_state.json                # inputs of the operon and marker steps (resume)
+├── all_promoters_verified.fasta         # motif-confirmed promoters, all (5'→3', shortlist order)
+├── marker_promoters_verified.fasta      # motif-confirmed marker promoters (5'→3', marker shortlist order)
 ├── cds_annotations.tsv                  # CDS product names from Prokka
 ├── profinder_results.tsv                # comprehensive results table
+├── marker_summary.tsv                   # one row per marker profile: best gene, its promoter region, call
 └── promoter_report.html                 # visual HTML report (top 10 promoters)
 ```
 
-The HTML report lists the top 10 motif-verified marker promoters, ordered by `shortlist_score` (fallback: motif path A→B→C then combined −log₁₀(p) when no ranker spec is available). Each promoter's sequence diagram is drawn proportional to its actual length and aligned on the 3' (gene-proximal) end, so the −10/−35 elements line up across rows.
+The HTML report lists the top 10 motif-verified marker promoters in marker shortlist order: best marker matches first, then by `shortlist_score` within each evidence class (see Marker evidence and shortlist order; fallback: motif path A→B→C then combined −log₁₀(p) when no ranker spec is available). Each promoter's sequence diagram is drawn proportional to its actual length and aligned on the 3' (gene-proximal) end, so the −10/−35 elements line up across rows.
 
 In `--diagnose-p-sweep` mode, steps 8, 10, and 11 are replaced by a `diagnostics/` directory (see Diagnostic mode above).
 
-Tandem- FASTA records are reverse-complemented so every sequence is oriented 5'→3'. The `profinder_results.tsv` table contains one row per promoter-orientation IGR (motif-confirmed rows first, ordered by `motif_shortlist_score` descending; unconfirmed rows follow in genomic order), with these columns:
+Tandem- FASTA records are reverse-complemented so every sequence is oriented 5'→3'. `all_promoters_verified.fasta` is written in shortlist order and `marker_promoters_verified.fasta` in marker shortlist order. The `profinder_results.tsv` table contains one row per promoter-orientation IGR (motif-confirmed rows first, ordered by `motif_shortlist_score` descending; unconfirmed rows follow in genomic order), with these columns:
 
 ```
 promoter_id, contig, start, end, length, orientation,
 associated_cds, gene_name, locus_tag, product,
-is_marker, motif_confirmed, motif_path,
+is_marker, marker_evidence, marker_gene, marker_profiles,
+motif_confirmed, motif_path,
 motif_source_10, motif_source_35, motif_has_ext10,
 motif_emp_p_10, motif_emp_p_35,
 motif_emp_p_35_uncorrected, motif_p35_multiplicity_k,
