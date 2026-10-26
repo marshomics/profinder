@@ -39,6 +39,9 @@ class Config:
     igr_size_max: int = 1000
 
     # ── Operon identification parameters ─────────────────────────────
+    # Consecutive same-strand genes at most max_internal_distance bp apart
+    # form a run; the run is an operon unless a gene on the same strand lies
+    # less than min_flanking_distance bp upstream of its first gene.
     max_internal_distance: int = 25
     min_flanking_distance: int = 75
 
@@ -163,6 +166,11 @@ class Config:
     def promoter_markers_hmm(self) -> Path:
         return self.operon_dir / "promoter_markers_hmm.tsv"
 
+    @property
+    def marker_best_hits(self) -> Path:
+        """One row per HMM profile: best-scoring gene(s), runner-up and margin."""
+        return self.operon_dir / "marker_best_hits.tsv"
+
     # ── Motif scan outputs (subdirectory) ────────────────────────────
     @property
     def motif_hits_all(self) -> Path:
@@ -185,7 +193,8 @@ class Config:
         return self.motif_dir / "promoter_markers_verified.tsv"
 
     # ── Final top-level deliverables ─────────────────────────────────
-    # Only these five files remain at the root of output_dir.
+    # These six files remain at the root of output_dir, next to the hidden
+    # step-state file .profinder_state.json (see pipeline._mark_current).
     @property
     def all_promoters_verified_fasta(self) -> Path:
         """FASTA of all CO_F/CO_R IGRs that passed the MEME motif
@@ -207,6 +216,12 @@ class Config:
     @property
     def final_table(self) -> Path:
         return self.output_dir / "profinder_results.tsv"
+
+    @property
+    def marker_summary(self) -> Path:
+        """One row per marker profile: best gene, nearest upstream promoter
+        region in its operon, and that region's call."""
+        return self.output_dir / "marker_summary.tsv"
 
     @property
     def report_html(self) -> Path:

@@ -64,7 +64,9 @@ Diagnostic mode
 """
 
 import argparse
+import hashlib
 import html as html_mod
+import json
 import math
 import os
 import re
@@ -101,7 +103,7 @@ _IGR_COLUMNS = ["igr_id", "contig", "start", "end", "length", "orientation",
                 "left_gene", "right_gene", "left_type", "right_type", "sequence",
                 "sequence_5p_to_3p"]
 _OPERON_COLUMNS = ["Operon", "SeqID", "Start", "End", "Attributes", "Gene",
-                   "SourceFile", "FirstGene"]
+                   "SourceFile", "FirstGene", "Strand"]
 
 
 def _require(step, *needed):
@@ -338,49 +340,68 @@ def _extract_gene_id(attributes: str) -> str:
     return ""
 
 
+OPERON_RULE = "same-strand runs; promoter-side flank"   # recorded with operons.tsv (step state)
+
+
 def _identify_operons(genes_df, max_internal_distance, min_flanking_distance):
-    """Two-pass operon identification: proximity clustering then
-    flanking-distance validation."""
+    """Strand-aware operon identification.
+
+    Pass 1 groups consecutive CDS on the same contig and the same strand
+    whose gap is at most ``max_internal_distance`` bp. The gap is measured
+    from the furthest end the group has reached, so a gene nested inside
+    another cannot split it. A change of strand always ends a group, however
+    close the genes are: genes on opposite strands cannot share a transcript.
+
+    Pass 2 tests only the promoter side of each group, the gap upstream of
+    its first gene in the direction of transcription (left of a + strand
+    group, right of a - strand group). If the neighbouring group on that side
+    lies on the same strand and less than ``min_flanking_distance`` bp away,
+    the group may continue an operon that starts further upstream, and it is
+    dropped. An opposite-strand neighbour, a contig end or a gap of at least
+    ``min_flanking_distance`` bp marks an unambiguous operon start. The gap
+    after the last gene is not tested: it bounds the operon's 3' end, not its
+    promoter.
+
+    A CDS whose strand is neither '+' nor '-' ends any group and is never
+    placed in an operon. ``genes_df`` must be sorted by contig and start
+    (as returned by _parse_gff_for_operons). Returns a list of operons, each
+    a list of gene rows in genome order.
+    """
     if genes_df.empty:
         return []
+    seq = genes_df["seqid"].tolist()
+    beg = genes_df["start"].tolist()
+    end = genes_df["end"].tolist()
+    strand = genes_df["strand"].tolist()
 
-    # Pass 1: cluster consecutive genes within max_internal_distance
-    raw_groups = []
-    current_group = [0]
-    for i in range(1, len(genes_df)):
-        prev = genes_df.iloc[i - 1]
-        curr = genes_df.iloc[i]
-        same_contig = curr["seqid"] == prev["seqid"]
-        close = (curr["start"] - prev["end"]) <= max_internal_distance
-        if same_contig and close:
-            current_group.append(i)
+    # Pass 1: same-strand proximity runs
+    groups, cur, reach = [], [0], end[0]
+    for i in range(1, len(seq)):
+        j = cur[-1]
+        if (seq[i] == seq[j] and strand[i] == strand[j] and strand[i] in ("+", "-")
+                and beg[i] - reach <= max_internal_distance):
+            cur.append(i)
+            reach = max(reach, end[i])
         else:
-            raw_groups.append(current_group)
-            current_group = [i]
-    raw_groups.append(current_group)
+            groups.append(cur)
+            cur, reach = [i], end[i]
+    groups.append(cur)
 
-    # Pass 2: validate flanking distances
+    # Pass 2: the promoter-side flank
+    lo = [beg[g[0]] for g in groups]
+    hi = [max(end[j] for j in g) for g in groups]
     operons = []
-    for group in raw_groups:
-        first_i, last_i = group[0], group[-1]
-        first_gene = genes_df.iloc[first_i]
-        last_gene = genes_df.iloc[last_i]
-
-        upstream_ok = True
-        if first_i > 0:
-            prev_gene = genes_df.iloc[first_i - 1]
-            if prev_gene["seqid"] == first_gene["seqid"]:
-                upstream_ok = (first_gene["start"] - prev_gene["end"]) >= min_flanking_distance
-
-        downstream_ok = True
-        if last_i < len(genes_df) - 1:
-            next_gene = genes_df.iloc[last_i + 1]
-            if next_gene["seqid"] == last_gene["seqid"]:
-                downstream_ok = (next_gene["start"] - last_gene["end"]) >= min_flanking_distance
-
-        if upstream_ok and downstream_ok:
-            operons.append([genes_df.iloc[j] for j in group])
-
+    for k, g in enumerate(groups):
+        s = strand[g[0]]
+        if s not in ("+", "-"):
+            continue
+        nb = k - 1 if s == "+" else k + 1
+        if (0 <= nb < len(groups) and seq[groups[nb][0]] == seq[g[0]]
+                and strand[groups[nb][0]] == s):
+            gap = lo[k] - hi[nb] if s == "+" else lo[nb] - hi[k]
+            if gap < min_flanking_distance:
+                continue
+        operons.append([genes_df.iloc[j] for j in g])
     return operons
 
 
@@ -412,6 +433,117 @@ def _parse_hmm_tblout(file_path: str) -> list:
 # =====================================================================
 #  Pipeline steps
 # =====================================================================
+
+# ── Rebuild on change: the operon and marker steps ───────────────────────
+# Steps 3, 6, 7, the marker shortlist of step 8, steps 10 and 11 and the
+# p-value sweep are quick and all depend on the operon rule. Each records a
+# fingerprint of its input files and settings in <output>/.profinder_state.json
+# and is skipped on a resumed run only when its outputs exist and that
+# fingerprint still matches. A changed operon rule, operon setting or upstream
+# file therefore rebuilds every dependent output, and a directory without the
+# state file (an older ProFinder, or a copy made without dot-files) rebuilds
+# them once. The genome-wide motif scan of step 8 is never repeated for this.
+# Bump _STATE_FORMAT whenever the logic of one of these steps changes.
+_STATE_FORMAT = 1
+_STATE_NAME = ".profinder_state.json"
+_LEGACY_WARNED = set()
+
+
+def _fingerprint(paths, params=None):
+    """sha256 over the contents of ``paths`` (None entries skipped; a missing
+    file is recorded as missing) and the JSON form of ``params``."""
+    h = hashlib.sha256(f"profinder-state-{_STATE_FORMAT}".encode())
+    for p in paths:
+        if p is None:
+            continue
+        p = Path(p)
+        h.update(b"\x00" + p.name.encode() + b"\x00")
+        if p.is_file():
+            h.update(str(p.stat().st_size).encode() + b"\x00")
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+        else:
+            h.update(b"missing")
+    h.update(json.dumps(params or {}, sort_keys=True, default=str).encode())
+    return h.hexdigest()
+
+
+def _state_path(cfg):
+    return Path(cfg.output_dir) / _STATE_NAME
+
+
+def _load_state(cfg):
+    try:
+        with open(_state_path(cfg)) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_state(cfg, state):
+    path = _state_path(cfg)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(state, fh, indent=1, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"  WARNING: could not write {path} ({e}); a resumed run will rebuild this step")
+
+
+def _is_current(cfg, key, outputs, inputs, params=None):
+    """True when every output exists and step ``key`` was last built from
+    exactly these input files and settings."""
+    if not all(Path(o).exists() for o in outputs):
+        return False
+    return _load_state(cfg).get(key) == _fingerprint(inputs, params)
+
+
+def _mark_current(cfg, key, inputs, params=None):
+    """Record that step ``key`` has just been built from these inputs."""
+    state = _load_state(cfg)
+    state[key] = _fingerprint(inputs, params)
+    _save_state(cfg, state)
+
+
+def _forget(cfg, key):
+    """Drop ``key`` before rebuilding it, so an interrupted rebuild is redone."""
+    state = _load_state(cfg)
+    if key in state:
+        del state[key]
+        _save_state(cfg, state)
+
+
+def _operon_params(cfg):
+    return {"rule": OPERON_RULE, "max_internal_distance": cfg.max_internal_distance,
+            "min_flanking_distance": cfg.min_flanking_distance}
+
+
+def _hmm_profile_names(cfg):
+    d = cfg.hmm_profiles_dir
+    return sorted(p.name for p in Path(d).glob("*.hmm")) if d is not None and Path(d).is_dir() else []
+
+
+def _step10_inputs(cfg):
+    return [cfg.igr_summary, cfg.promoter_markers, cfg.motif_best_all, cfg.cds_annotations,
+            cfg.marker_best_hits, cfg.operon_file, cfg.operon_filtered_markers, cfg.gff_file,
+            cfg.input_fasta]
+
+
+def _warn_legacy_operons(cfg):
+    """Warn once per output directory when operons.tsv predates the strand-aware rule."""
+    key = str(Path(cfg.output_dir).resolve())
+    if key in _LEGACY_WARNED or not cfg.operon_file.exists() or _has_column(cfg.operon_file, "Strand"):
+        return
+    _LEGACY_WARNED.add(key)
+    print("  WARNING: operons/operons.tsv was made by an older ProFinder whose operons ignore "
+          "strand; the marker results use it as it is. Re-run from step 3 to apply the "
+          "current operon rule.")
+
 
 def step01_run_prokka(cfg: Config, force: bool = False):
     """Annotate the input genome with Prokka."""
@@ -523,18 +655,24 @@ def step02_extract_igrs(cfg: Config, force: bool = False):
 
 
 def step03_identify_operons(cfg: Config, force: bool = False):
-    """Identify operons from the Prokka GFF."""
-    if not force and cfg.operon_file.exists():
+    """Identify operons from the Prokka GFF (rule: see _identify_operons)."""
+    s3_in, s3_par = [cfg.gff_file], _operon_params(cfg)
+    if not force and _is_current(cfg, "step3", [cfg.operon_file], s3_in, s3_par):
         print("── Operon file already exists, skipping ──")
         print("  Step 3 complete.\n")
         return
+    if not force and cfg.operon_file.exists():
+        print("── Operon file was made from another annotation, other operon settings or an "
+              "older operon rule; rebuilding ──")
 
     _require(3, (cfg.gff_file, 1))
+    _forget(cfg, "step3")
     print("── Identifying operons ──")
     genes_df = _parse_gff_for_operons(str(cfg.gff_file))
     if genes_df.empty:
         print("  WARNING: no CDS features found in GFF")
         pd.DataFrame(columns=_OPERON_COLUMNS).to_csv(cfg.operon_file, sep="\t", index=False)
+        _mark_current(cfg, "step3", s3_in, s3_par)
         print("  Step 3 complete.\n")
         return
 
@@ -545,32 +683,30 @@ def step03_identify_operons(cfg: Config, force: bool = False):
     rows = []
     for op_idx, operon in enumerate(operons, start=1):
         operon_id = f"operon{op_idx}"
-        first_genes = set()
+        # An operon lies on one strand. Its first gene in the direction of
+        # transcription is the leftmost on the + strand (yes_1) and the one
+        # that reaches furthest right on the - strand (yes_2).
         if operon[0]["strand"] == "+":
-            first_genes.add((0, "yes_1"))
-        if operon[-1]["strand"] == "-":
-            first_genes.add((len(operon) - 1, "yes_2"))
-
+            first, tag = 0, "yes_1"
+        else:
+            first = max(range(len(operon)), key=lambda j: (operon[j]["end"], j))
+            tag = "yes_2"
         for gi, gene in enumerate(operon):
-            gene_id = _extract_gene_id(gene["attributes"])
-            label = "No"
-            for (idx, tag) in first_genes:
-                if gi == idx:
-                    label = tag
-                    break
             rows.append({
                 "Operon": operon_id,
                 "SeqID": gene["seqid"],
                 "Start": gene["start"],
                 "End": gene["end"],
                 "Attributes": gene["attributes"],
-                "Gene": gene_id,
+                "Gene": _extract_gene_id(gene["attributes"]),
                 "SourceFile": source,
-                "FirstGene": label,
+                "FirstGene": tag if gi == first else "No",
+                "Strand": gene["strand"],
             })
 
     df = pd.DataFrame(rows, columns=_OPERON_COLUMNS)
     df.to_csv(cfg.operon_file, sep="\t", index=False)
+    _mark_current(cfg, "step3", s3_in, s3_par)
     print(f"  Operons ({len(operons)} operons, {len(df)} gene rows) -> {cfg.operon_file}")
     print("  Step 3 complete.\n")
 
@@ -696,20 +832,25 @@ def step05_filter_hmm(cfg: Config, force: bool = False):
 
 def step06_filter_operons_add_markers(cfg: Config, force: bool = False):
     """Filter operons and merge with HMM marker gene info."""
-    if not force and cfg.operon_filtered_markers.exists():
+    s6_out, s6_in = [cfg.operon_filtered, cfg.operon_filtered_markers], [cfg.operon_file, cfg.hmm_filtered]
+    if not force and _is_current(cfg, "step6", s6_out, s6_in):
         print("── Filtered operons with markers already exists, skipping ──")
         print("  Step 6 complete.\n")
         return
 
     _require(6, (cfg.operon_file, 3), (cfg.hmm_filtered, 5))
+    _forget(cfg, "step6")
     print("── Filtering operons ──")
     try:
         df = pd.read_csv(cfg.operon_file, sep="\t")
     except pd.errors.EmptyDataError:                # header-less file from an older run
         df = pd.DataFrame(columns=_OPERON_COLUMNS)
+    _warn_legacy_operons(cfg)
     if df.empty:
         print("  No operons to filter.")
+        df.to_csv(cfg.operon_filtered, sep="\t", index=False)
         df.to_csv(cfg.operon_filtered_markers, sep="\t", index=False)
+        _mark_current(cfg, "step6", s6_in)
         print("  Step 6 complete.\n")
         return
 
@@ -717,6 +858,12 @@ def step06_filter_operons_add_markers(cfg: Config, force: bool = False):
     single_contig = df.groupby("Operon").filter(
         lambda g: g["SeqID"].nunique() == 1
     )
+    # Step 3 puts every operon on one strand; drop a mixed-strand operon from a
+    # hand-edited or older operons.tsv rather than misorder its genes.
+    if "Strand" in single_contig.columns:
+        single_contig = single_contig.groupby("Operon").filter(
+            lambda g: g["Strand"].nunique() == 1
+        )
     # Keep operons with at least one promoter-boundary gene
     has_first = single_contig.groupby("Operon").filter(
         lambda g: g["FirstGene"].isin(["yes_1", "yes_2"]).any()
@@ -773,17 +920,393 @@ def step06_filter_operons_add_markers(cfg: Config, force: bool = False):
         # back to treating every operon as a marker operon.
         sys.exit(f"{cfg.hmm_filtered} is empty - re-run step 5 (e.g. --start 5 --force).")
 
+    _mark_current(cfg, "step6", s6_in)
     print("  Step 6 complete.\n")
+
+
+# ── Marker evidence: best match first ────────────────────────────────────
+# Every gene with an HMM hit >= --hmm-bitscore is a marker candidate, but each
+# profile's best-scoring gene is the likeliest true single-copy marker; lower-
+# scoring hits are mostly paralogs. A promoter-orientation IGR counts as a
+# marker region only if it can drive a hit gene: the gene immediately
+# downstream of it (in the direction of transcription) or a later gene of the
+# same operon. Labels, in marker-shortlist order:
+#   best_match               the driven gene is some profile's best hit
+#   best_match_via_operon    a later gene of the operon is some profile's best hit
+#   weaker_match             the driven gene has only lower-scoring hits
+#   weaker_match_via_operon  only lower-scoring hits lie later in the operon
+MARKER_EVIDENCE_RANK = {"best_match": 1, "best_match_via_operon": 2,
+                        "weaker_match": 3, "weaker_match_via_operon": 4}
+MARKER_EVIDENCE_LABEL = {"best_match": "best match",
+                         "best_match_via_operon": "best match (via operon)",
+                         "weaker_match": "weaker match",
+                         "weaker_match_via_operon": "weaker match (via operon)"}
+_MARKER_EVIDENCE_COLS = ["marker_evidence", "marker_rank", "marker_gene",
+                         "marker_profiles", "marker_bitscore", "marker_genes_downstream"]
+_MARKER_BEST_COLUMNS = ["profile", "best_gene", "best_bitscore", "n_genes_hit",
+                        "n_tied_best", "runner_up_gene", "runner_up_bitscore", "margin_bits"]
+_MARKER_SUMMARY_COLUMNS = ["profile", "best_gene", "gene_name", "product", "best_bitscore",
+                           "n_genes_hit", "n_tied_best", "runner_up_gene", "runner_up_bitscore",
+                           "margin_bits", "promoter_id", "link", "genes_between",
+                           "marker_evidence", "motif_confirmed", "motif_path",
+                           "motif_shortlist_score", "note"]
+
+
+def _hmm_hit_table(hmm):
+    """(profile, gene, bit score) per hit, with ``is_best`` marking each
+    profile's highest-scoring gene(s); tied genes are all kept."""
+    cols = ["query_name", "target_name", "full_sequence_bitscore"]
+    if hmm is None or len(hmm) == 0 or not set(cols) <= set(hmm.columns):
+        return pd.DataFrame(columns=cols + ["is_best"])
+    h = hmm[cols].copy()
+    h["full_sequence_bitscore"] = pd.to_numeric(h["full_sequence_bitscore"], errors="coerce")
+    h = h.dropna(subset=["full_sequence_bitscore"])
+    if h.empty:
+        return pd.DataFrame(columns=cols + ["is_best"])
+    h = h.groupby(["query_name", "target_name"], as_index=False)["full_sequence_bitscore"].max()
+    top = h.groupby("query_name")["full_sequence_bitscore"].transform("max")
+    h["is_best"] = h["full_sequence_bitscore"] == top
+    return h
+
+
+def _marker_best_hits_table(h):
+    """One row per profile with at least one hit: best gene(s), runner-up, margin."""
+    rows = []
+    for q, g in h.groupby("query_name", sort=True):
+        g = g.sort_values(["full_sequence_bitscore", "target_name"], ascending=[False, True])
+        best, rest = g[g["is_best"]], g[~g["is_best"]]
+        b = float(best["full_sequence_bitscore"].iloc[0])
+        r = float(rest["full_sequence_bitscore"].iloc[0]) if len(rest) else np.nan
+        rows.append({"profile": q, "best_gene": ",".join(best["target_name"].astype(str)),
+                     "best_bitscore": b, "n_genes_hit": int(len(g)), "n_tied_best": int(len(best)),
+                     "runner_up_gene": str(rest["target_name"].iloc[0]) if len(rest) else "",
+                     "runner_up_bitscore": r, "margin_bits": (b - r) if len(rest) else np.nan})
+    return pd.DataFrame(rows, columns=_MARKER_BEST_COLUMNS)
+
+
+def _operon_order(ops):
+    """gene -> (operon, position, genes in transcription order). With a
+    Strand column (operons.tsv from this version) a + strand operon runs left
+    to right by Start and a - strand operon right to left by End. Without it,
+    ``yes_1`` marks an operon transcribed from its leftmost gene and ``yes_2``
+    one transcribed from its rightmost (step 6 drops operons carrying both)."""
+    order = {}
+    if ops is None or len(ops) == 0 or not {"Operon", "Gene", "Start", "FirstGene"} <= set(ops.columns):
+        return order
+    o = ops.drop_duplicates(["Operon", "Gene"])
+    stranded = {"Strand", "End"} <= set(o.columns)
+    for op, g in o.groupby("Operon", sort=False):
+        strands = set(g["Strand"]) if stranded else set()
+        if strands == {"+"}:
+            genes = list(g.sort_values("Start", kind="mergesort")["Gene"])
+        elif strands == {"-"}:
+            genes = list(g.sort_values("End", ascending=False, kind="mergesort")["Gene"])
+        else:
+            fwd = bool((g["FirstGene"] == "yes_1").any())
+            genes = list(g.sort_values("Start", ascending=fwd, kind="mergesort")["Gene"])
+        for k, gene in enumerate(genes):
+            order[gene] = (op, k, genes)
+    return order
+
+
+def _driven_label(d, order, best_prof, best_bits, any_prof, any_bits):
+    """Marker evidence for a region whose downstream gene is ``d``:
+    (label, marker gene, profiles, bit score, genes downstream) or None."""
+    if not isinstance(d, str) or d not in order:
+        return None
+    _op, k, genes = order[d]
+    later = genes[k + 1:]
+    if d in best_prof:
+        return ("best_match", d, best_prof[d], best_bits[d], 0)
+    for j, g in enumerate(later, 1):
+        if g in best_prof:
+            return ("best_match_via_operon", g, best_prof[g], best_bits[g], j)
+    if d in any_prof:
+        return ("weaker_match", d, any_prof[d], any_bits[d], 0)
+    for j, g in enumerate(later, 1):
+        if g in any_prof:
+            return ("weaker_match_via_operon", g, any_prof[g], any_bits[g], j)
+    return None
+
+
+def _marker_evidence_table(igr, ops, h):
+    """One row per IGR that can drive a gene with an HMM hit (CO_F, CO_R, and
+    DP regions for information), with its marker evidence."""
+    order = _operon_order(ops)
+    join = lambda s: ",".join(sorted(set(s)))
+    hb = h[h["is_best"].astype(bool)] if len(h) else h
+    best_prof = hb.groupby("target_name")["query_name"].agg(join).to_dict() if len(hb) else {}
+    best_bits = hb.groupby("target_name")["full_sequence_bitscore"].max().to_dict() if len(hb) else {}
+    any_prof = h.groupby("target_name")["query_name"].agg(join).to_dict() if len(h) else {}
+    any_bits = h.groupby("target_name")["full_sequence_bitscore"].max().to_dict() if len(h) else {}
+    recs = []
+    for _, r in igr.iterrows():
+        o = r.get("orientation")
+        if o == "CO_F":
+            cands = [r.get("right_gene")]
+        elif o == "CO_R":
+            cands = [r.get("left_gene")]
+        elif o == "DP":
+            cands = [r.get("left_gene"), r.get("right_gene")]
+        else:
+            continue
+        labs = [x for x in (_driven_label(d, order, best_prof, best_bits, any_prof, any_bits)
+                            for d in cands) if x]
+        if not labs:
+            continue
+        lab = min(labs, key=lambda x: (MARKER_EVIDENCE_RANK[x[0]], x[4]))
+        recs.append({"igr_id": r["igr_id"], "marker_evidence": lab[0],
+                     "marker_rank": MARKER_EVIDENCE_RANK[lab[0]], "marker_gene": lab[1],
+                     "marker_profiles": lab[2], "marker_bitscore": float(lab[3]),
+                     "marker_genes_downstream": int(lab[4])})
+    return pd.DataFrame(recs, columns=["igr_id"] + _MARKER_EVIDENCE_COLS)
+
+
+def _has_column(path, col):
+    """True if the TSV at ``path`` has a header containing ``col``."""
+    try:
+        with open(path) as fh:
+            return col in fh.readline().rstrip("\n").split("\t")
+    except OSError:
+        return False
+
+
+def _load_marker_evidence(cfg):
+    """promoter_markers.tsv -> evidence columns indexed by igr_id (CO_F/CO_R)."""
+    empty = pd.DataFrame(columns=_MARKER_EVIDENCE_COLS)
+    try:
+        m = pd.read_csv(cfg.promoter_markers, sep="\t")
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        return empty
+    if m.empty or not {"igr_id", "orientation"} <= set(m.columns):
+        return empty
+    m = m[m["orientation"].isin(["CO_F", "CO_R"])].copy()
+    if "marker_evidence" not in m.columns:          # written by an older version
+        for c, v in zip(_MARKER_EVIDENCE_COLS, ["", 9, "", "", np.nan, np.nan]):
+            m[c] = v
+    return m.drop_duplicates("igr_id").set_index("igr_id")[_MARKER_EVIDENCE_COLS]
+
+
+def _attach_marker_evidence(igr, ev):
+    """Add marker_evidence / marker_gene / marker_profiles (blank when none)."""
+    for c in ("marker_evidence", "marker_gene", "marker_profiles"):
+        igr[c] = (igr["igr_id"].map(ev[c]).fillna("") if ev is not None and len(ev)
+                  else "")
+    return igr
+
+
+def _marker_order(df, prefix=""):
+    """Marker shortlist order: marker evidence (best match first), then the
+    shortlist order within each evidence class."""
+    if df is None or len(df) == 0:
+        return df
+    out = _shortlist_order(df, prefix=prefix)
+    rank_col = out[prefix + "marker_rank"] if (prefix + "marker_rank") in out.columns else None
+    if rank_col is None:
+        return out
+    rank = pd.to_numeric(rank_col, errors="coerce").fillna(9).to_numpy()
+    return out.iloc[np.lexsort((np.arange(len(out)), rank))].reset_index(drop=True)
+
+
+def _write_promoter_outputs(cfg, calls, n_prom=None):
+    """Write the promoter FASTAs and the marker shortlist from per-IGR calls.
+    all_promoters_verified.fasta is in shortlist order; the marker shortlist
+    (motif_best_markers.tsv, promoter_markers_verified.tsv,
+    marker_promoters_verified.fasta) is best-match first, then shortlist order."""
+    have = calls is not None and len(calls) > 0
+    ranked = _shortlist_order(calls) if have else calls
+    if have:
+        _write_fasta(ranked, cfg.all_promoters_verified_fasta, short_header=False)
+    else:
+        open(cfg.all_promoters_verified_fasta, "w").close()
+    if n_prom is not None:
+        print(f"  All promoters: {len(ranked) if have else 0}/{n_prom} intervals called (path A/B/C)")
+    ev = _load_marker_evidence(cfg)
+    if have and len(ev):
+        mcalls = ranked[ranked["igr_id"].isin(ev.index)].copy()
+        for c in _MARKER_EVIDENCE_COLS:
+            mcalls[c] = mcalls["igr_id"].map(ev[c])
+        mcalls = _marker_order(mcalls)
+    else:
+        base_cols = list(calls.columns) if calls is not None else []
+        mcalls = pd.DataFrame(columns=base_cols + [c for c in _MARKER_EVIDENCE_COLS if c not in base_cols])
+    mcalls.to_csv(cfg.motif_best_markers, sep="\t", index=False)
+    mcalls.to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
+    if len(mcalls):
+        _write_fasta(mcalls, cfg.marker_promoters_verified_fasta, short_header=False)
+    else:
+        open(cfg.marker_promoters_verified_fasta, "w").close()
+    by = mcalls["marker_evidence"].value_counts().to_dict() if len(mcalls) else {}
+    print(f"  Marker promoters: {len(mcalls)} called ("
+          + ", ".join(f"{MARKER_EVIDENCE_LABEL[k]} {by.get(k, 0)}" for k in MARKER_EVIDENCE_RANK)
+          + f") -> {cfg.promoter_markers_verified}")
+
+
+def _gff_gene_names(gff_path):
+    """locus tag / ID -> (gene name, product) from a Prokka GFF."""
+    names = {}
+    try:
+        with open(gff_path) as fh:
+            for line in fh:
+                if line.startswith("##FASTA"):
+                    break
+                f = line.rstrip("\n").split("\t")
+                if len(f) != 9 or f[2] in ("gene", "region"):
+                    continue
+                a = dict(kv.split("=", 1) for kv in f[8].split(";") if "=" in kv)
+                for key in (a.get("locus_tag"), a.get("ID")):   # operon gene IDs prefer ID=
+                    if key and key not in names:
+                        names[key] = (a.get("gene", ""), a.get("product", ""))
+    except OSError:
+        pass
+    return names
+
+
+def _lost_marker_note(cfg, gene, names, gene_op, op_labels, op_contigs,
+                      op_strands=None, gene_strand=None, legacy=False):
+    """Why a profile's best gene lies outside every operon kept by step 6.
+    Step 3 places a + or - strand gene in a run of same-strand genes and
+    drops the run only when a gene on the same strand lies within
+    (--max-internal-dist, --min-flanking-dist) bp upstream of its first gene.
+    Step 6 removes operons that span contigs, mix strands or have an
+    ambiguous first gene; only a hand-edited or older operons.tsv has them."""
+    if gene not in names:
+        return "best gene not found in the annotation (GFF)"
+    op = gene_op.get(gene)
+    if op is None:
+        if legacy:
+            return ("best gene is in no operon (step 3; operons/operons.tsv was made by an "
+                    "older ProFinder whose operons ignore strand)")
+        if gene_strand is not None and gene_strand.get(gene) not in ("+", "-"):
+            return "best gene has no strand in the annotation, so it is in no operon (step 3)"
+        return (f"best gene is in no operon (step 3): a gene on the same strand lies "
+                f"{cfg.max_internal_distance + 1}-{cfg.min_flanking_distance - 1} bp upstream "
+                f"of its gene cluster, so its operon may start further upstream")
+    labels = op_labels.get(op, set())
+    if len(op_contigs.get(op, set())) > 1:
+        why = "it spans contigs"
+    elif op_strands is not None and len(op_strands.get(op, set())) > 1:
+        why = "it has genes on both strands"
+    elif {"yes_1", "yes_2"} <= labels:
+        why = f"it joins convergent genes {cfg.max_internal_distance} bp or less apart"
+    elif not labels & {"yes_1", "yes_2"}:
+        why = f"it joins divergent genes {cfg.max_internal_distance} bp or less apart"
+    else:
+        return "best gene is not in a retained operon (step 6)"
+    return f"best gene's operon was removed (step 6): {why}"
+
+
+def _write_marker_summary(cfg, final):
+    """marker_summary.tsv: one row per marker profile with its best-scoring
+    gene, the nearest promoter-orientation region upstream of that gene in its
+    operon, and that region's call; ``note`` says why no region was scanned."""
+    profiles = []
+    hdir = cfg.hmm_profiles_dir
+    if hdir is not None and Path(hdir).is_dir():
+        for f in sorted(Path(hdir).glob("*.hmm")):
+            name = f.stem
+            with open(f) as fh:
+                for line in fh:
+                    if line.startswith("NAME"):
+                        name = line.split(None, 1)[1].strip()
+                        break
+            profiles.append(name)
+    try:
+        best = pd.read_csv(cfg.marker_best_hits, sep="\t")
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        best = pd.DataFrame(columns=_MARKER_BEST_COLUMNS)
+    try:
+        ops = pd.read_csv(cfg.operon_filtered_markers, sep="\t")
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        ops = pd.DataFrame()
+    try:
+        allops = pd.read_csv(cfg.operon_file, sep="\t")
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        allops = pd.DataFrame(columns=_OPERON_COLUMNS)
+    legacy = "Strand" not in allops.columns
+    gene_op, op_labels, op_contigs, op_strands = {}, {}, {}, {}
+    for o, gene, lab, sid in zip(allops["Operon"], allops["Gene"], allops["FirstGene"], allops["SeqID"]):
+        gene_op[gene] = o
+        op_labels.setdefault(o, set()).add(lab)
+        op_contigs.setdefault(o, set()).add(sid)
+    if not legacy:
+        for o, s in zip(allops["Operon"], allops["Strand"]):
+            op_strands.setdefault(o, set()).add(s)
+    gene_strand = {}
+    if cfg.gff_file.exists():
+        gdf = _parse_gff_for_operons(str(cfg.gff_file))
+        for a, s in zip(gdf.get("attributes", []), gdf.get("strand", [])):
+            gene_strand.setdefault(_extract_gene_id(a), s)
+    try:
+        igr = pd.read_csv(cfg.igr_summary, sep="\t")
+    except (FileNotFoundError, pd.errors.EmptyDataError):
+        igr = pd.DataFrame(columns=_IGR_COLUMNS)
+    order = _operon_order(ops)
+    drive = {}
+    for _, r in igr.iterrows():
+        if r.get("orientation") == "CO_F":
+            drive[r.get("right_gene")] = r["igr_id"]
+        elif r.get("orientation") == "CO_R":
+            drive[r.get("left_gene")] = r["igr_id"]
+    dp = igr[igr["orientation"] == "DP"] if "orientation" in igr.columns else igr.iloc[0:0]
+    dp_flank = set(dp.get("left_gene", pd.Series(dtype=str))) | set(dp.get("right_gene", pd.Series(dtype=str)))
+    names = _gff_gene_names(cfg.gff_file)
+    fin = final.set_index("promoter_id") if final is not None and len(final) else pd.DataFrame()
+    bt = best.set_index("profile") if len(best) else best
+    rows = []
+    for p in sorted(set(profiles) | set(best["profile"].astype(str))):
+        rec = {c: "" for c in _MARKER_SUMMARY_COLUMNS}
+        rec["profile"] = p
+        if p not in getattr(bt, "index", []):
+            rec["note"] = f"no hit >= {cfg.hmm_bitscore_min:g} bits"
+            rows.append(rec)
+            continue
+        b = bt.loc[p]
+        g = str(b["best_gene"]).split(",")[0]
+        gn, pr = names.get(g, ("", ""))
+        rec.update(best_gene=b["best_gene"], gene_name=gn, product=pr,
+                   best_bitscore=b["best_bitscore"], n_genes_hit=int(b["n_genes_hit"]),
+                   n_tied_best=int(b["n_tied_best"]), runner_up_gene=b["runner_up_gene"],
+                   runner_up_bitscore=b["runner_up_bitscore"], margin_bits=b["margin_bits"])
+        if g not in order:
+            rec["note"] = _lost_marker_note(cfg, g, names, gene_op, op_labels, op_contigs,
+                                            op_strands, gene_strand, legacy)
+        else:
+            _op, k, og = order[g]
+            link = next(((drive[og[j]], k - j) for j in range(k, -1, -1) if og[j] in drive), None)
+            if link is None:
+                rec["note"] = ("upstream region is divergent (not scanned)" if og[0] in dp_flank
+                               else "no intergenic region upstream within the length limits")
+            else:
+                pid, between = link
+                rec.update(promoter_id=pid, link="direct" if between == 0 else "via_operon",
+                           genes_between=int(between))
+                if len(fin) and pid in fin.index:
+                    row = fin.loc[pid]
+                    rec.update(marker_evidence=row.get("marker_evidence", ""),
+                               motif_confirmed=bool(row.get("motif_confirmed", False)),
+                               motif_path=row.get("motif_path", ""),
+                               motif_shortlist_score=row.get("motif_shortlist_score", ""))
+                    if not bool(row.get("motif_confirmed", False)):
+                        rec["note"] = "region scanned; no -10/-35 call at the current thresholds"
+        rows.append(rec)
+    pd.DataFrame(rows, columns=_MARKER_SUMMARY_COLUMNS).to_csv(cfg.marker_summary, sep="\t", index=False)
+    n_called = sum(1 for r in rows if r.get("motif_confirmed") is True)
+    print(f"  Marker summary ({len(rows)} profiles; {n_called} with a called promoter) -> {cfg.marker_summary}")
 
 
 def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
     """Match IGRs to marker operon genes."""
-    if not force and cfg.promoter_markers.exists() and cfg.promoter_markers_hmm.exists():
+    s7_out = [cfg.promoter_markers, cfg.promoter_markers_hmm, cfg.marker_best_hits]
+    s7_in = [cfg.igr_summary, cfg.operon_filtered_markers, cfg.hmm_filtered]
+    if not force and _is_current(cfg, "step7", s7_out, s7_in):
         print("── Promoter markers file already exists, skipping ──")
         print("  Step 7 complete.\n")
         return
 
     _require(7, (cfg.igr_summary, 2), (cfg.operon_filtered_markers, 6), (cfg.hmm_filtered, 5))
+    _forget(cfg, "step7")
+    _warn_legacy_operons(cfg)
     print("── Matching IGRs to marker operons ──")
     try:
         igr = pd.read_csv(cfg.igr_summary, sep="\t")
@@ -795,69 +1318,56 @@ def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
         print("  No marker data available.")
         pd.DataFrame().to_csv(cfg.promoter_markers, sep="\t", index=False)
         pd.DataFrame().to_csv(cfg.promoter_markers_hmm, sep="\t", index=False)
+        pd.DataFrame(columns=_MARKER_BEST_COLUMNS).to_csv(cfg.marker_best_hits, sep="\t", index=False)
+        _mark_current(cfg, "step7", s7_in)
         print("  Step 7 complete.\n")
         return
 
-    marker_genes = set(markers["Gene"].dropna())
+    try:
+        hmm = pd.read_csv(cfg.hmm_filtered, sep="\t")
+    except pd.errors.EmptyDataError:
+        hmm = pd.DataFrame()
+    h = _hmm_hit_table(hmm)
+    best_tab = _marker_best_hits_table(h)
+    best_tab.to_csv(cfg.marker_best_hits, sep="\t", index=False)
+    print(f"  Best-scoring gene per profile ({len(best_tab)} profiles with a hit) -> {cfg.marker_best_hits}")
 
-    # Match: an IGR is a promoter candidate if one of its flanking genes
-    # is a marker gene, and the orientation is promoter-relevant.
+    # A region is a marker region only if it can drive a gene with an HMM hit:
+    # the gene immediately downstream of it or a later gene of the same operon.
+    # Regions that lie downstream of every hit gene in an operon cannot drive
+    # any of them and are not marker regions.
+    ev = _marker_evidence_table(igr, markers, h)
     igr = igr.copy()
     igr["marker_match"] = "none"
-
-    # CO_F: right_gene (downstream on + strand) is the marker
-    co_f = (igr["orientation"] == "CO_F") & igr["right_gene"].isin(marker_genes)
-    igr.loc[co_f, "marker_match"] = "CO_F"
-
-    # CO_R: left_gene (downstream on - strand, since gene runs right to left) is the marker
-    co_r = (igr["orientation"] == "CO_R") & igr["left_gene"].isin(marker_genes)
-    igr.loc[co_r, "marker_match"] = "CO_R"
-
-    # DP: either flanking gene could be a marker
-    dp_left = (igr["orientation"] == "DP") & igr["left_gene"].isin(marker_genes)
-    dp_right = (igr["orientation"] == "DP") & igr["right_gene"].isin(marker_genes)
-    igr.loc[dp_left | dp_right, "marker_match"] = "DP"
-
-    matched = igr[igr["marker_match"] != "none"].copy()
+    hit_ids = set(ev["igr_id"])
+    for o in ("CO_F", "CO_R", "DP"):
+        igr.loc[(igr["orientation"] == o) & igr["igr_id"].isin(hit_ids), "marker_match"] = o
+    matched = igr[igr["marker_match"] != "none"].merge(ev, on="igr_id", how="left")
     matched.to_csv(cfg.promoter_markers, sep="\t", index=False)
-    print(f"  Matched promoter markers ({len(matched)} rows) -> {cfg.promoter_markers}")
+    by = matched["marker_evidence"].value_counts().to_dict() if len(matched) else {}
+    print(f"  Matched promoter markers ({len(matched)} rows: "
+          + ", ".join(f"{MARKER_EVIDENCE_LABEL[k]} {by.get(k, 0)}" for k in MARKER_EVIDENCE_RANK)
+          + f") -> {cfg.promoter_markers}")
 
-    # Build expanded variant with one row per IGR × HMM profile match.
-    # Determine which gene column is the marker gene for each matched IGR.
-    matched["marker_gene"] = np.where(matched["marker_match"] == "CO_F",
+    # Expanded variant: one row per marker region x HMM profile hit by the
+    # DRIVEN gene (the gene immediately downstream), flagged is_best_hit when
+    # that gene is the profile's best-scoring hit. Regions labelled via_operon
+    # have no direct hit and are absent here.
+    matched["driven_gene"] = np.where(matched["marker_match"] == "CO_F",
                                       matched["right_gene"], matched["left_gene"])
-
-    # Load HMM filtered hits for the profile names
-    hmm_profiles = pd.DataFrame()
-    if cfg.hmm_filtered.exists():
-        try:
-            hmm_profiles = pd.read_csv(
-                cfg.hmm_filtered, sep="\t",
-                usecols=["target_name", "query_name"],
-            )
-        except (pd.errors.EmptyDataError, ValueError):
-            pass
-
-    if hmm_profiles.empty:
+    if h.empty:
         matched["hmm_profile"] = "no_hmm"
+        matched["is_best_hit"] = False
         expanded = matched
     else:
-        # Inner merge: only keep IGRs whose marker gene has a direct HMM
-        # hit.  Step 6 keeps entire operons when any gene in the operon
-        # matches, so some IGRs flank operon-member genes that have no HMM
-        # hit themselves.  Those are excluded here.
-        expanded = pd.merge(
-            matched, hmm_profiles,
-            how="inner",
-            left_on="marker_gene", right_on="target_name",
-        )
-        expanded.rename(columns={"query_name": "hmm_profile"}, inplace=True)
-        expanded.drop(columns=["target_name"], inplace=True, errors="ignore")
-
-    expanded.drop(columns=["marker_gene"], inplace=True, errors="ignore")
+        hp = h.rename(columns={"target_name": "driven_gene", "query_name": "hmm_profile",
+                               "is_best": "is_best_hit"})[["driven_gene", "hmm_profile", "is_best_hit"]]
+        expanded = pd.merge(matched, hp, how="inner", on="driven_gene")
+    expanded = expanded.drop(columns=["driven_gene"], errors="ignore")
     expanded.to_csv(cfg.promoter_markers_hmm, sep="\t", index=False)
     print(f"  Expanded markers with HMM profiles ({len(expanded)} rows) "
           f"-> {cfg.promoter_markers_hmm}")
+    _mark_current(cfg, "step7", s7_in)
     print("  Step 7 complete.\n")
 
 
@@ -959,12 +1469,38 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
     """
     from . import empirical as emp
 
+    s8_out = [cfg.motif_best_markers, cfg.promoter_markers_verified,
+              cfg.all_promoters_verified_fasta, cfg.marker_promoters_verified_fasta]
+    s8_in = [cfg.promoter_markers, cfg.motif_best_all]
     if not force and cfg.motif_best_all.exists() and cfg.promoter_markers_verified.exists():
-        print("── Empirical motif scan already done, skipping ──")
+        if _is_current(cfg, "step8_markers", s8_out, s8_in):
+            print("── Empirical motif scan already done, skipping ──")
+        elif not _has_column(cfg.motif_best_all, "igr_id"):
+            # The scan found no promoter-orientation IGRs: nothing to rebuild.
+            print("── Empirical motif scan already done, skipping ──")
+            _mark_current(cfg, "step8_markers", s8_in)
+        elif not _has_column(cfg.promoter_markers, "marker_evidence"):
+            print("── Empirical motif scan already done, skipping ──")
+            print("  WARNING: operons/promoter_markers.tsv has no marker evidence (made by an "
+                  "older ProFinder); re-run from step 7 to rebuild the marker shortlist.")
+        else:
+            # The marker regions changed since the shortlist was written (or an
+            # older version wrote it): rebuild the shortlist outputs from the
+            # existing calls; no rescan needed.
+            _warn_legacy_operons(cfg)
+            print("── Empirical motif scan already done; rebuilding the marker shortlist "
+                  "from the current marker regions ──")
+            _forget(cfg, "step8_markers")
+            # round_trip parsing: the rebuilt shortlist must carry the exact
+            # floats a full scan writes, not the default parser's rounding
+            _write_promoter_outputs(cfg, pd.read_csv(cfg.motif_best_all, sep="\t",
+                                                     float_precision="round_trip"))
+            _mark_current(cfg, "step8_markers", s8_in)
         print("  Step 8 complete.\n")
         return
 
     _require(8, (cfg.igr_summary, 2), (cfg.promoter_markers, 7))
+    _forget(cfg, "step8_markers")
     meme_file = cfg.meme_file
     if meme_file is None or not Path(meme_file).is_file():
         bundled = Path(__file__).parent / "all_unique_subgroups.meme"
@@ -1032,6 +1568,7 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
             pd.DataFrame().to_csv(p, sep="\t", index=False)
         open(cfg.all_promoters_verified_fasta, "w").close()
         open(cfg.marker_promoters_verified_fasta, "w").close()
+        _mark_current(cfg, "step8_markers", s8_in)
         print("  Step 8 complete.\n")
         return
 
@@ -1047,27 +1584,8 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
             calls[c] = ""
 
     calls.to_csv(cfg.motif_best_all, sep="\t", index=False)
-    if not calls.empty:
-        _write_fasta(calls, cfg.all_promoters_verified_fasta, short_header=False)
-    else:
-        open(cfg.all_promoters_verified_fasta, "w").close()
-    print(f"  All promoters: {len(calls)}/{n_prom} intervals called (path A/B/C)")
-
-    marker_ids = set()
-    try:
-        m = pd.read_csv(cfg.promoter_markers, sep="\t")
-        marker_ids = set(m[m["orientation"].isin(["CO_F", "CO_R"])]["igr_id"])
-    except (FileNotFoundError, pd.errors.EmptyDataError, KeyError):
-        pass
-    mcalls = (calls[calls["igr_id"].isin(marker_ids)].copy()
-              if (not calls.empty and marker_ids) else calls.iloc[0:0].copy())
-    mcalls.to_csv(cfg.motif_best_markers, sep="\t", index=False)
-    mcalls.to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
-    if not mcalls.empty:
-        _write_fasta(mcalls, cfg.marker_promoters_verified_fasta, short_header=False)
-    else:
-        open(cfg.marker_promoters_verified_fasta, "w").close()
-    print(f"  Marker promoters: {len(mcalls)} called -> {cfg.promoter_markers_verified}")
+    _write_promoter_outputs(cfg, calls, n_prom)
+    _mark_current(cfg, "step8_markers", s8_in)
     print("  Step 8 complete.\n")
 
 
@@ -1092,7 +1610,8 @@ _SCAN_MOTIF_COLS = [
 _FINAL_TABLE_COLUMNS = [
     "igr_id", "contig", "start", "end", "length", "orientation",
     "associated_cds", "gene_name", "locus_tag", "product",
-    "is_marker", "motif_confirmed", "motif_path",
+    "is_marker", "marker_evidence", "marker_gene", "marker_profiles",
+    "motif_confirmed", "motif_path",
     "motif_source_10", "motif_source_35", "motif_has_ext10",
     "motif_emp_p_10", "motif_emp_p_35",
     "motif_emp_p_35_uncorrected", "motif_p35_multiplicity_k",
@@ -1134,7 +1653,7 @@ def _shortlist_order(df, prefix=""):
 
 
 def _assemble_final_table(igr_df, calls_df, marker_ids, ann_map,
-                          cds_bp=0, contigs=None):
+                          cds_bp=0, contigs=None, marker_ev=None):
     """Build a ``profinder_results.tsv``-shaped DataFrame (the canonical
     ``_FINAL_TABLE_COLUMNS`` layout) from pre-loaded IGRs and a per-IGR calls
     DataFrame (the empirical scan output — ``scan_igrs`` / ``motif_best_all``
@@ -1163,6 +1682,7 @@ def _assemble_final_table(igr_df, calls_df, marker_ids, ann_map,
     igr["product"] = igr["associated_cds"].map(
         lambda g: (ann_map or {}).get(g, {}).get("product", ""))
     igr["is_marker"] = (igr["igr_id"].isin(marker_ids) if marker_ids else False)
+    igr = _attach_marker_evidence(igr, marker_ev)
 
     motif_map = {}
     if calls_df is not None and len(calls_df) > 0:
@@ -1303,11 +1823,20 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
 
     out_tsv = cfg.diagnostics_dir / "p_sweep.tsv"
     out_png = cfg.diagnostics_dir / "p_sweep.png"
-    if out_tsv.exists() and not force:
+    bundled_meme = Path(__file__).parent / "all_unique_subgroups.meme"
+    ps_in = [cfg.igr_summary, cfg.promoter_markers, cfg.cds_annotations,
+             cfg.fna_file if cfg.fna_file.exists() else cfg.input_fasta,
+             cfg.meme_file if cfg.meme_file is not None and Path(cfg.meme_file).is_file()
+             else bundled_meme]
+    ps_par = {"sweep": [sweep_min, sweep_max, sweep_n, list(modes), p35_relaxed_ratio],
+              "cfg": [cfg.motif_p10, cfg.motif_p35, cfg.n_shuffles,
+                      cfg.max_dist_to_cds_start, cfg.cds_bp]}
+    if not force and _is_current(cfg, "p_sweep", [out_tsv], ps_in, ps_par):
         print("── p-value sweep diagnostic already exists, skipping ──")
         print(f"  -> {out_tsv}")
         print("  Diagnostic complete.\n")
         return
+    _forget(cfg, "p_sweep")
 
     cfg.diagnostics_dir.mkdir(parents=True, exist_ok=True)
     tables_dir = cfg.diagnostics_dir / "sweep_tables"
@@ -1362,6 +1891,7 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
     sweep_ps = _logspace_p_values(sweep_min, sweep_max, sweep_n)
     print("── p-value sweep diagnostic (empirical null) ──")
     print(f"  IGRs to scan: {len(all_igr)}  (markers: {len(marker_ids)})")
+    marker_ev = _load_marker_evidence(cfg)
     print(f"  Background ({Path(bg_source).name}): "
           f"A={bg[0]:.3f} C={bg[1]:.3f} G={bg[2]:.3f} T={bg[3]:.3f}")
     print(f"  Sweep: {sweep_n} log-spaced points in "
@@ -1404,7 +1934,8 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
             counts = _scan_counts(calls, marker_ids)
 
             final = _assemble_final_table(all_igr, calls, marker_ids, ann_map,
-                                          cds_bp=cfg.cds_bp, contigs=contigs)
+                                          cds_bp=cfg.cds_bp, contigs=contigs,
+                                          marker_ev=marker_ev)
             final_conf = final[final["motif_confirmed"]].copy()
             sweep_table_path = (tables_dir /
                                 _sweep_table_filename(mode, p10, p35, p35_relaxed))
@@ -1441,6 +1972,7 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
     except Exception as e:
         print(f"  Figure rendering failed: {e}")
 
+    _mark_current(cfg, "p_sweep", ps_in, ps_par)
     print("  Diagnostic complete.\n")
 
 
@@ -1627,12 +2159,17 @@ def _build_motif_diagram_svg(seq_len, motif_hits, width=700, height=50,
 def step11_generate_report(cfg: Config, force: bool = False):
     """Generate an HTML report combining promoters, CDS annotations,
     and motif hit positions with visual sequence diagrams."""
-    if not force and cfg.report_html.exists():
+    s11_in = [cfg.final_table, cfg.promoter_markers_verified, cfg.all_promoters_verified_fasta,
+              cfg.marker_promoters_verified_fasta, cfg.cds_annotations, cfg.igr_summary,
+              cfg.input_fasta]
+    s11_par = {"archaea": bool(cfg.is_archaea)}
+    if not force and _is_current(cfg, "step11", [cfg.report_html], s11_in, s11_par):
         print("── HTML report already exists, skipping ──")
         print("  Step 11 complete.\n")
         return
 
     _require(11, (cfg.igr_summary, 2), (cfg.promoter_markers_verified, 8), (cfg.cds_annotations, 9))
+    _forget(cfg, "step11")
     print("── Generating HTML report ──")
 
     # Only motif-verified marker promoters (step 8) are reported. The
@@ -1650,6 +2187,9 @@ def step11_generate_report(cfg: Config, force: bool = False):
     if promoter_df is None or promoter_df.empty:
         print("  No verified marker promoters available for report "
               "(run step 8 first, or the scan called none).")
+        if cfg.report_html.exists():
+            cfg.report_html.unlink()
+            print("  Removed the report of an earlier run, which no longer matches these results.")
         print("  Step 11 complete.\n")
         return
 
@@ -1688,7 +2228,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
     has_motif_cols = "pos_10" in promoter_df.columns
 
     if has_motif_cols:
-        promoter_df = _shortlist_order(promoter_df)
+        promoter_df = _marker_order(promoter_df)
     _ranked_by_score = bool(
         has_motif_cols and "shortlist_score" in promoter_df.columns
         and pd.to_numeric(promoter_df["shortlist_score"], errors="coerce").notna().any())
@@ -1750,13 +2290,16 @@ def step11_generate_report(cfg: Config, force: bool = False):
     </div>
     <p style="font-size:0.8rem; color:#777; margin-bottom:16px;">
         """ + (
-        "Showing the top 10 promoters by <code>shortlist_score</code>, a ranker fitted on 49 "
+        "Showing the top 10 marker promoters, best marker matches first (a profile's "
+        "highest-scoring gene, then one reached through its operon, then weaker matches) and "
+        "within each class by <code>shortlist_score</code>, a ranker fitted on 49 "
         "genomes and validated by leave-one-genome-out to put real promoters at the top of the "
         "list: about 11 of the top 20 calls carry an annotated intergenic transcription start, "
         "against about 9 under the ordering this replaces. The score orders calls &mdash; it is "
         "not a calibrated probability that a given promoter will work in a construct."
         if _ranked_by_score else
-        "Showing the top 10 promoters ordered by motif path (A&rarr;B&rarr;C) and then combined "
+        "Showing the top 10 marker promoters, best marker matches first, then ordered by motif "
+        "path (A&rarr;B&rarr;C) and combined "
         "&minus;log<sub>10</sub>(p); no ranker spec was available for <code>shortlist_score</code>.") + """
         Sequence diagrams are drawn
         proportional to promoter length and aligned on the 3' (gene-proximal) end.
@@ -1789,6 +2332,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
         <th>Length</th>
         <th>Orientation</th>
         <th>Motif path</th>
+        <th title="How strongly the region is tied to a marker profile; best matches are listed first">Marker evidence</th>
         <th>&minus;10</th>
         <th>&minus;35</th>
         <th title="Length-standardised empirical score (score_std): best combined &minus;log10 empirical quantile of a &minus;10/&minus;35 pair over all spacer-linked positions, minus the shuffle-null location fitted on log(n_pairs). A ranker input, not the sort key.">Score</th>
@@ -1870,6 +2414,13 @@ def step11_generate_report(cfg: Config, force: bool = False):
         else:
             path_cell = '<span class="path path-none">&mdash;</span>'
             row_class = ""
+        ev_key = row.get("marker_evidence", "")
+        ev_key = ev_key if isinstance(ev_key, str) else ""
+        if ev_key in MARKER_EVIDENCE_LABEL:
+            ev_title = html_mod.escape(f"{row.get('marker_profiles', '')}: {row.get('marker_gene', '')}")
+            evidence_cell = f'<span title="{ev_title}">{MARKER_EVIDENCE_LABEL[ev_key]}</span>'
+        else:
+            evidence_cell = "&mdash;"
 
         def _to_float(v):
             try:
@@ -1933,6 +2484,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
             <td>{row['length']}</td>
             <td><span class="orient {orient_class}">{row['orientation']}</span></td>
             <td>{path_cell}</td>
+            <td>{evidence_cell}</td>
             <td>{minus10_cell}</td>
             <td>{minus35_cell}</td>
             <td>{score_cell}</td>
@@ -1951,6 +2503,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
 
     with open(cfg.report_html, "w") as fh:
         fh.write("\n".join(html_parts))
+    _mark_current(cfg, "step11", s11_in, s11_par)
     print(f"  Report -> {cfg.report_html}")
     print("  Step 11 complete.\n")
 
@@ -2087,7 +2640,14 @@ def step10_final_table(cfg: Config, force: bool = False):
     gene_name             Gene name from Prokka GFF (gene= attribute)
     locus_tag             Locus tag from Prokka GFF (locus_tag= attribute)
     product               Protein product name from Prokka GFF
-    is_marker             Whether this IGR flanks a marker-operon gene
+    is_marker             Whether this IGR can drive a gene with a marker
+                          HMM hit (the gene immediately downstream, or a
+                          later gene of the same operon)
+    marker_evidence       best_match | best_match_via_operon |
+                          weaker_match | weaker_match_via_operon (blank
+                          when not a marker region); see README
+    marker_gene           The hit gene the label refers to
+    marker_profiles       HMM profile(s) behind the label
     motif_confirmed       Whether a -10/-35 motif combination was found
     motif_path            Motif path classification (A, B, or C)
     motif_source_10       Subgroup ID of the best -10 hit (e.g. M001)
@@ -2165,13 +2725,18 @@ def step10_final_table(cfg: Config, force: bool = False):
                           calibration's applicability domain
     sequence_5p_to_3p     Full promoter sequence oriented 5'→3'
     """
-    if not force and cfg.final_table.exists():
+    s10_out, s10_in = [cfg.final_table, cfg.marker_summary], _step10_inputs(cfg)
+    s10_par = {"cds_bp": cfg.cds_bp, "hmm_bitscore_min": cfg.hmm_bitscore_min,
+               "profiles": _hmm_profile_names(cfg), "operons": _operon_params(cfg)}
+    if not force and _is_current(cfg, "step10", s10_out, s10_in, s10_par):
         print("── Final output table already exists, skipping ──")
         print("  Step 10 complete.\n")
         return
 
     _require(10, (cfg.igr_summary, 2), (cfg.promoter_markers, 7),
              (cfg.motif_best_all, 8), (cfg.cds_annotations, 9))
+    _forget(cfg, "step10")
+    _warn_legacy_operons(cfg)
     print("── Building final output table ──")
 
     # 1. Start from ALL promoter-orientation IGRs
@@ -2184,6 +2749,8 @@ def step10_final_table(cfg: Config, force: bool = False):
     if igr.empty:
         print("  No promoter-orientation IGRs found.")
         pd.DataFrame().to_csv(cfg.final_table, sep="\t", index=False)
+        _write_marker_summary(cfg, pd.DataFrame())
+        _mark_current(cfg, "step10", s10_in, s10_par)
         print("  Step 10 complete.\n")
         return
 
@@ -2228,6 +2795,7 @@ def step10_final_table(cfg: Config, force: bool = False):
         except (pd.errors.EmptyDataError, KeyError):
             pass
     igr["is_marker"] = igr["igr_id"].isin(marker_igr_ids)
+    igr = _attach_marker_evidence(igr, _load_marker_evidence(cfg))
 
     # 6. Motif scan results (best hit per IGR from step 8). Column layout is
     # shared with the p-sweep diagnostic via the module-level constants.
@@ -2263,6 +2831,8 @@ def step10_final_table(cfg: Config, force: bool = False):
 
     out.to_csv(cfg.final_table, sep="\t", index=False)
     print(f"  Final table ({len(out)} rows) -> {cfg.final_table}")
+    _write_marker_summary(cfg, out)
+    _mark_current(cfg, "step10", s10_in, s10_par)
     print("  Step 10 complete.\n")
 
 
@@ -2390,9 +2960,13 @@ def main():
     parser.add_argument("--igr-max", type=int, default=1000,
                         help="Maximum IGR length (default: 1000)")
     parser.add_argument("--max-internal-dist", type=int, default=25,
-                        help="Max distance between genes in an operon (default: 25)")
+                        help="Max gap between consecutive same-strand genes of an "
+                             "operon in bp (default: 25)")
     parser.add_argument("--min-flanking-dist", type=int, default=75,
-                        help="Min flanking distance for operon boundaries (default: 75)")
+                        help="Min gap to a same-strand gene upstream of an operon's "
+                             "first gene in bp; a closer one means the operon may start "
+                             "further upstream, so it is dropped. The gap after the last "
+                             "gene is not tested (default: 75)")
     parser.add_argument("--hmm-bitscore", type=float, default=25.0,
                         help="Minimum HMM bitscore (default: 25.0)")
     parser.add_argument("--cds-bp", type=int, default=0,
