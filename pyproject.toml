@@ -46,6 +46,7 @@ Repository = "https://github.com/jmarsh/profinder"
 include = ["profinder*"]
 
 [tool.setuptools.package-data]
+# promoter_ranker.json is REQUIRED at runtime by ranker.py (shortlist_score).
 # ppv_calibration.json ships only if a calibration has been fitted and
 # placed at profinder/ppv_calibration.json; harmless when absent.
-profinder = ["all_unique_subgroups.meme", "hmms/*.hmm", "motifs/*.meme", "ppv_calibration.json"]
+profinder = ["all_unique_subgroups.meme", "hmms/*.hmm", "motifs/*.meme", "promoter_ranker.json", "ppv_calibration.json"]
