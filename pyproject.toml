@@ -38,7 +38,7 @@ stats = ["scipy>=1.7"]
 profinder = "profinder.pipeline:main"
 
 [project.urls]
-Repository = "https://github.com/jmarsh/profinder"
+Repository = "https://github.com/marshomics/profinder"
 
 # "profinder*" captures the profinder.empirical subpackage (it has an
 # __init__.py), so its modules ship without a separate entry.

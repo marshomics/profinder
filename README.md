@@ -20,7 +20,7 @@ ProFinder reports two promoter sets from every run: a genome-wide catalogue of e
 
 ## Requirements
 
-ProFinder needs Python ≥ 3.9, [Prokka](https://github.com/tseemann/prokka), and [HMMER](http://hmmer.org/) (specifically `hmmsearch`). The −10/−35 scan reads MEME-format motif files directly in Python, so the MEME suite is **not** required. HMM profiles and the motif file are bundled with the package.
+ProFinder needs Python ≥ 3.9, [Prokka](https://github.com/tseemann/prokka) ≥ 1.14.6, and [HMMER](http://hmmer.org/) (specifically `hmmsearch`). The −10/−35 scan reads MEME-format motif files directly in Python, so the MEME suite is **not** required. HMM profiles and the motif file are bundled with the package.
 
 Python dependencies: `pandas ≥ 1.3`, `numpy ≥ 1.20`, `biopython ≥ 1.79` (listed in `pyproject.toml` and `requirements.txt`). `scipy` is optional (used only for an optional generalised-Pareto tail refinement in the empirical null). `matplotlib` is optional and only used to render the figure in the p-value-sweep diagnostic.
 
@@ -30,15 +30,17 @@ Python dependencies: `pandas ≥ 1.3`, `numpy ≥ 1.20`, `biopython ≥ 1.79` (l
 **1. Create the environment and install the external tools**
 
 ```bash
-conda create -n profinder -c bioconda -c conda-forge \
-    python=3.12 prokka hmmer pip -y
+conda create -n profinder -c conda-forge -c bioconda \
+    python=3.12 "prokka>=1.14.6" hmmer pip -y
 conda activate profinder
 ```
+
+List conda-forge before bioconda, as bioconda requires, and keep the Prokka pin: without it some solvers (for example mamba 1.5) resolve Prokka 1.13, which misreads current BLAST releases as too old and cannot annotate. ProFinder checks the Prokka version before step 1 and stops with this advice if it is older than 1.14.6.
 
 **2. Clone and install ProFinder**
 
 ```bash
-git clone https://github.com/jmarsh/profinder.git
+git clone https://github.com/marshomics/profinder.git
 cd profinder
 pip install .
 ```
@@ -61,7 +63,7 @@ pip install ".[diagnostics]"     # adds matplotlib for --diagnose-p-sweep
 
 ```bash
 profinder --list          # prints the 11 pipeline steps
-prokka --version          # should print version ≥ 1.14
+prokka --version          # should print 1.14.6 or later
 hmmsearch -h | head -1     # should print the HMMER version
 ```
 
@@ -70,8 +72,8 @@ hmmsearch -h | head -1     # should print the HMMER version
 If bioconda's Prokka conflicts with other packages, install each tool in its own environment and point ProFinder at them:
 
 ```bash
-conda create -n prokka_env -c bioconda -c conda-forge prokka -y
-conda create -n hmmer_env  -c bioconda -c conda-forge hmmer -y
+conda create -n prokka_env -c conda-forge -c bioconda "prokka>=1.14.6" -y
+conda create -n hmmer_env  -c conda-forge -c bioconda hmmer -y
 
 conda create -n profinder -c conda-forge python=3.12 pip -y
 conda activate profinder
@@ -110,6 +112,8 @@ profinder --batch samples.tsv -o results/
 ```
 
 The pipeline checkpoints at each step. Re-running the same command skips completed steps. Use `--force` to re-run everything.
+
+**Input.** A nucleotide genome FASTA (optionally gzipped) with unique contig IDs. Contig IDs longer than Prokka's 37-character limit are shortened for Prokka and restored in every ProFinder output; `prokka/contig_id_map.tsv` records the mapping. ProFinder stops with a message naming the problem, before any annotation, on an empty, protein or duplicate-ID FASTA; it also stops when a step's inputs are missing (for example `--start 8` in a directory where steps 1–7 never ran) or when `hmmsearch` cannot run, rather than writing empty or unscreened results.
 
 
 ## Pipeline steps
