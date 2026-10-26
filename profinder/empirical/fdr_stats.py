@@ -13,7 +13,6 @@ One pooled construction per (length x dinucleotide-composition) stratum:
 
 import math
 import numpy as np
-from .ae_shuffle import ae_shuffle
 from . import fdr_core as fc
 
 try:
@@ -84,7 +83,10 @@ def _emp_p_row(scores_row, null_sorted):
 
 
 def sidak(p, k):
-   
+    """Šidák-adjust a p-value that is the minimum over k comparisons:
+    P(min p <= a) = 1 - (1 - a)^k. Used for Path C, whose -35 is the best
+    match among all subgroups other than the one supplying the -10; Paths A
+    and B fix the subgroup from the -10 and are reported unadjusted."""
     if k is None or k <= 1:
         return float(p)
     p = min(max(float(p), 0.0), 1.0)
@@ -282,10 +284,28 @@ class StratumNull:
         return T - (a + b * math.log(n)), n
 
     def classify_and_score(self, seq, spacer=None):
-        """Full path A/B/C classification on the empirical element thresholds
-        (A: linked strict -35 same subgroup; B: extended -10 + linked relaxed
-        -35; C: unlinked strict -35), plus the length-standardised continuous
-        score. Returns a call record, or None if there is no A/B/C hit."""
+        """Full path A/B/C classification on the empirical element thresholds,
+        plus the length-standardised continuous score. Returns a call record,
+        or None if there is no A/B/C hit.
+
+        At every -10 position i and spacer-linked -35 position j = i - 6 - spacer:
+
+        * **Path A** -- some subgroup s passes the strict -10 threshold at i AND
+          its own strict -35 threshold at j (a linked pair). Every -10-passing
+          subgroup is tested, not only the single most significant one: many
+          catalogue subgroups share a TATAAT-like -10 and differ in the -35, so
+          testing only the sharpest -10 subgroup mis-routed canonical linked
+          promoters (e.g. TTGACA-N17-TATAAT) to Path C.
+        * **Path B** -- i carries an extended -10 ("TGn" 5' of the hexamer) and
+          some -10-passing subgroup has a relaxed -35 at j.
+        * **Path C** -- the most significant -10 subgroup at i (ties on the
+          empirical quantile broken on raw log-odds) with the best strict -35
+          from any OTHER subgroup at j; emp_p_35 is Sidak-adjusted for the
+          S35-1 subgroups searched.
+
+        Within a path the (subgroup, spacer) pair with the largest combined
+        -log10(p10) - log10(p35) is kept; across positions the call minimising
+        (path rank A<B<C, -combined) is reported."""
         sp0, sp1 = spacer or self.spacer
         code = fc.encode(seq)
         s10 = fc.score_stack(code, self.pwm10)
@@ -293,56 +313,95 @@ class StratumNull:
         P = s10.shape[1]
         if P <= 0:
             return None
-        ep10 = empp_stack(s10, self.null10); ep35 = empp_stack(s35, self.null35)
-        ep10m = np.where(s10 >= self.thr10[:, None], ep10, np.inf)
-        best10_p = ep10m.min(0); best10_sub = ep10m.argmin(0)
-        ep35sm = np.where(s35 >= self.thr35s[:, None], ep35, np.inf)
-        best35s_p = ep35sm.min(0); best35s_sub = ep35sm.argmin(0)
-        m35rhit = s35 >= self.thr35r[:, None]
         w = fc._MOTIF_WIDTH
+        ep10 = empp_stack(s10, self.null10); ep35 = empp_stack(s35, self.null35)
+        nl10 = -np.log10(ep10); nl35 = -np.log10(ep35)
+        pass10 = s10 >= self.thr10[:, None]          # (S, P) strict -10 pass
+        m35s = s35 >= self.thr35s[:, None]           # strict -35 pass
+        m35r = s35 >= self.thr35r[:, None]           # relaxed -35 pass
         lo = 0 if self.max_dist is None else max(0, len(code) - w - int(self.max_dist))
         name = lambda k: self.subs[k] if self.subs is not None else str(k)
-        best = None
-        for i in np.where(np.isfinite(best10_p))[0]:
-            if i < lo:
+        NEG = -np.inf
+
+        # Greedy most-significant -10 subgroup per position (Path C anchor).
+        ep10m = np.where(pass10, ep10, np.inf)
+        best10_p = ep10m.min(0)
+        best10_sub = np.where(ep10m == best10_p[None, :], s10, NEG).argmax(0)
+        # Best and second-best strict -35 per position (to exclude the -10's
+        # own subgroup for Path C without a per-position rescan).
+        ep35sm = np.where(m35s, ep35, np.inf)
+        ord35 = np.argsort(ep35sm, axis=0, kind="stable")
+        top1_sub = ord35[0]; top1_p = ep35sm[top1_sub, np.arange(P)]
+        if self.S35 > 1:
+            top2_sub = ord35[1]; top2_p = ep35sm[top2_sub, np.arange(P)]
+        else:
+            top2_sub = top1_sub; top2_p = np.full(P, np.inf)
+
+        # Extended -10 flag per position: "TG" at i-3, i-2.
+        ext10 = np.zeros(P, dtype=bool)
+        for i in range(3, P):
+            ext10[i] = seq[i - 3:i - 1] == "TG"
+
+        # Per-position bests for each path: combined score, subgroup(s), j, spacer.
+        combA = np.full(P, NEG); subA = np.zeros(P, int); jA = np.zeros(P, int); spA = np.zeros(P, int)
+        combB = np.full(P, NEG); subB = np.zeros(P, int); jB = np.zeros(P, int); spB = np.zeros(P, int)
+        combC = np.full(P, NEG); subC = np.zeros(P, int); jC = np.zeros(P, int); spC = np.zeros(P, int)
+        for spc in range(sp0, sp1 + 1):
+            off = w + spc
+            if off >= P:
                 continue
-            sub10 = int(best10_sub[i]); p10 = best10_p[i]
-            ext10 = i >= 3 and seq[i - 3:i - 1] == "TG"
-            bA = bB = bC = None
-            for spc in range(sp0, sp1 + 1):
-                j = i - w - spc
-                if j < 0:
-                    continue
-                if np.isfinite(best35s_p[j]):
-                    if int(best35s_sub[j]) == sub10:
-                        if bA is None or best35s_p[j] < bA[0]:
-                            bA = (best35s_p[j], j, spc, int(best35s_sub[j]))
-                    elif bC is None or best35s_p[j] < bC[0]:
-                        bC = (best35s_p[j], j, spc, int(best35s_sub[j]))
-                if m35rhit[sub10, j] and (bB is None or ep35[sub10, j] < bB[0]):
-                    bB = (ep35[sub10, j], j, spc, sub10)
-            if bA is not None:
-                path, ch = "A", bA
-            elif ext10 and bB is not None:
-                path, ch = "B", bB
-            elif bC is not None:
-                path, ch = "C", bC
+            ii = np.arange(off, P); jj = ii - off
+            raw = s10[:, ii] + s35[:, jj]                      # tie-break on raw log-odds
+            # -- Path A: linked strict pair, any subgroup --
+            mA = pass10[:, ii] & m35s[:, jj]
+            cA = np.where(mA, nl10[:, ii] + nl35[:, jj], NEG)
+            bestA = cA.max(0)
+            kA = np.where(cA == bestA[None, :], raw, NEG).argmax(0)
+            upd = bestA > combA[ii]
+            combA[ii[upd]] = bestA[upd]; subA[ii[upd]] = kA[upd]; jA[ii[upd]] = jj[upd]; spA[ii[upd]] = spc
+            # -- Path B: strict -10 + relaxed -35, any subgroup (ext10 gate applied later) --
+            mB = pass10[:, ii] & m35r[:, jj]
+            cB = np.where(mB, nl10[:, ii] + nl35[:, jj], NEG)
+            bestB = cB.max(0)
+            kB = np.where(cB == bestB[None, :], raw, NEG).argmax(0)
+            upd = bestB > combB[ii]
+            combB[ii[upd]] = bestB[upd]; subB[ii[upd]] = kB[upd]; jB[ii[upd]] = jj[upd]; spB[ii[upd]] = spc
+            # -- Path C: greedy -10 subgroup with best strict -35 of another subgroup --
+            g = best10_sub[ii]
+            use2 = top1_sub[jj] == g
+            pC = np.where(use2, top2_p[jj], top1_p[jj])
+            sC = np.where(use2, top2_sub[jj], top1_sub[jj])
+            valid = np.isfinite(best10_p[ii]) & np.isfinite(pC)
+            cC = np.where(valid, -np.log10(best10_p[ii]) - np.log10(np.maximum(pC, 1e-300)), NEG)
+            upd = cC > combC[ii]
+            combC[ii[upd]] = cC[upd]; subC[ii[upd]] = sC[upd]; jC[ii[upd]] = jj[upd]; spC[ii[upd]] = spc
+
+        best = None
+        for i in range(lo, P):
+            if combA[i] > NEG:
+                path, k, j, spc = "A", int(subA[i]), int(jA[i]), int(spA[i])
+                p10 = float(ep10[k, i]); p35_raw = float(ep35[k, j]); sub35 = k
+            elif ext10[i] and combB[i] > NEG:
+                path, k, j, spc = "B", int(subB[i]), int(jB[i]), int(spB[i])
+                p10 = float(ep10[k, i]); p35_raw = float(ep35[k, j]); sub35 = k
+            elif combC[i] > NEG:
+                path, k, j, spc = "C", int(best10_sub[i]), int(jC[i]), int(spC[i])
+                sub35 = int(subC[i]); p10 = float(best10_p[i]); p35_raw = float(ep35[sub35, j])
             else:
                 continue
             k35 = (self.S35 - 1) if path == "C" else 1
-            p35_raw = float(ch[0])
             p35_adj = sidak(p35_raw, k35)
             comb = -math.log10(p10) - math.log10(max(p35_adj, 1e-300))
             key = ({"A": 0, "B": 1, "C": 2}[path], -comb)
             if best is None or key < best[0]:
-                best = (key, {"path": path, "emp_p_10": float(p10),
+                best = (key, {"path": path, "emp_p_10": p10,
                               "emp_p_35": p35_adj,
                               "emp_p_35_uncorrected": p35_raw,
                               "p35_multiplicity_k": int(k35),
                               "pos_10": int(i),
-                              "pos_35": int(ch[1]), "spacer": int(ch[2]),
-                              "source_10": name(sub10), "source_35": name(ch[3]),
-                              "has_ext10": bool(ext10)})
+                              "pos_35": int(j), "spacer": int(spc),
+                              "source_10": name(k), "source_35": name(sub35),
+                              "has_ext10": bool(ext10[i])})
         if best is None:
             return None
         rec = best[1]

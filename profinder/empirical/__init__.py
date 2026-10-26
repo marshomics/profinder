@@ -9,3 +9,11 @@ from .fdr_stats import (StratumNull, stratify, benjamini_hochberg, empp_stack,
 from .ppv_calibration import (Calibration, fit_isotonic_ppv,
                               per_tier_precision, logo_isotonic_ppv, pava)
 from .scan import scan_igrs, build_scan_engine, reclassify
+
+__all__ = [
+    "ae_shuffle", "dinucleotide_counts",
+    "parse_meme", "paired_subgroups", "freq_to_logodds", "encode", "score_stack",
+    "StratumNull", "stratify", "benjamini_hochberg", "empp_stack", "sidak",
+    "Calibration", "fit_isotonic_ppv", "per_tier_precision", "logo_isotonic_ppv", "pava",
+    "scan_igrs", "build_scan_engine", "reclassify",
+]

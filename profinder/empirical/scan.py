@@ -33,6 +33,9 @@ def build_scan_engine(igr_df, pwm10, pwm35, subs, *, max_dist, n_shuffles=10,
     stratum label -> (member_indices, StratumNull). The nulls are
     threshold-independent, so a p-value sweep can re-threshold them cheaply
     via reclassify() without re-shuffling."""
+    if n_shuffles < 1:
+        raise ValueError(f"n_shuffles must be >= 1 (got {n_shuffles}); the empirical "
+                         f"null needs at least one shuffle per interval")
     co = igr_df[igr_df["orientation"].isin(["CO_F", "CO_R"])].copy().reset_index(drop=True)
     if co.empty:
         return co, [], np.array([]), {}

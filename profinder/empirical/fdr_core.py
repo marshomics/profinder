@@ -5,7 +5,6 @@
 - numpy-vectorised position scoring of a whole motif stack over a sequence
 """
 
-import math
 import numpy as np
 
 _BASE_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
