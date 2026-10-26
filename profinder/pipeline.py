@@ -66,8 +66,12 @@ Diagnostic mode
 import argparse
 import html as html_mod
 import math
+import os
+import re
+import shlex
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 import gzip
 import numpy as np
@@ -85,6 +89,135 @@ _REVCOMP_TRANS = str.maketrans("ACGTacgt", "TGCAtgca")
 def _revcomp_simple(s: str) -> str:
     """Fast reverse-complement using the module-level translation table."""
     return s.translate(_REVCOMP_TRANS)[::-1]
+
+
+# =====================================================================
+#  Input, tool and prerequisite guards
+# =====================================================================
+
+_PROKKA_MIN_VERSION = (1, 14, 6)
+_PROKKA_MAX_CONTIG_ID = 37          # Prokka refuses longer contig IDs
+_IGR_COLUMNS = ["igr_id", "contig", "start", "end", "length", "orientation",
+                "left_gene", "right_gene", "left_type", "right_type", "sequence",
+                "sequence_5p_to_3p"]
+_OPERON_COLUMNS = ["Operon", "SeqID", "Start", "End", "Attributes", "Gene",
+                   "SourceFile", "FirstGene"]
+
+
+def _require(step, *needed):
+    """Stop with a clear message when a step's inputs are missing.
+    ``needed`` holds (path, producing_step) pairs."""
+    missing = [(Path(p), s) for p, s in needed if not Path(p).exists()]
+    if missing:
+        lines = "\n".join(f"    {p}   (written by step {s})" for p, s in missing)
+        first = min(s for _, s in missing)
+        sys.exit(f"Step {step} cannot run: required input(s) missing:\n{lines}\n"
+                 f"Run the earlier steps first (e.g. --start {first}), or check that "
+                 f"-o points at the output directory of a previous run.")
+
+
+def _run_tool(conda_env, command):
+    """Run a shell command under bash, optionally inside a conda env."""
+    prefix = (f'eval "$(conda shell.bash hook 2>/dev/null)"; conda activate {conda_env}; '
+              if conda_env else "")
+    return subprocess.run(["bash", "-c", "set -euo pipefail; " + prefix + command],
+                          capture_output=True, text=True)
+
+
+def _check_prokka(cfg):
+    """Fail fast when Prokka is missing or too old to annotate."""
+    r = _run_tool(cfg.conda_env_prokka, f"{cfg.prokka_bin} --version")
+    text = (r.stdout + r.stderr).strip()
+    m = re.search(r"prokka\s+(\d+)\.(\d+)(?:\.(\d+))?", text, re.I)
+    where = f" in conda env {cfg.conda_env_prokka}" if cfg.conda_env_prokka else ""
+    if r.returncode != 0 or not m:
+        sys.exit(f"Prokka is not runnable as '{cfg.prokka_bin}'{where}: "
+                 f"{text[-300:] or 'no output'}\n"
+                 f"Install it with: conda install -c conda-forge -c bioconda 'prokka>=1.14.6' "
+                 f"(or pass --prokka / --conda-prokka).")
+    ver = tuple(int(x or 0) for x in m.groups())
+    if ver < _PROKKA_MIN_VERSION:
+        sys.exit(f"Prokka {'.'.join(map(str, ver))} found{where}, but ProFinder needs Prokka >= 1.14.6: "
+                 f"older releases misread BLAST >= 2.10 as 'too old' and cannot annotate. "
+                 f"Upgrade with: conda install -c conda-forge -c bioconda 'prokka>=1.14.6'.")
+    return ver
+
+
+def _validate_genome_fasta(path):
+    """Check the input is a nucleotide FASTA with unique IDs before spending a
+    Prokka run on it. Returns the contig IDs."""
+    ids, n_bases, n_acgtn = [], 0, 0
+    try:
+        with _open_maybe_gzip(path) as fh:
+            for rec in SeqIO.parse(fh, "fasta"):
+                seq = str(rec.seq).upper()
+                ids.append(rec.id)
+                n_bases += len(seq)
+                n_acgtn += sum(seq.count(b) for b in "ACGTN")
+    except (OSError, ValueError, UnicodeDecodeError, EOFError) as e:
+        sys.exit(f"Cannot read input FASTA {path}: {e}")
+    if not ids or n_bases == 0:
+        sys.exit(f"Input FASTA {path} contains no sequences (empty file, or not FASTA format).")
+    frac = n_acgtn / n_bases
+    if frac < 0.9:
+        sys.exit(f"Input FASTA {path} does not look like a nucleotide genome: only "
+                 f"{100 * frac:.0f}% of its characters are A/C/G/T/N. ProFinder needs a "
+                 f"genome assembly (nucleotide FASTA), not protein sequences.")
+    dup = [i for i, k in Counter(ids).items() if k > 1]
+    if dup:
+        sys.exit(f"Input FASTA {path} has duplicate contig IDs: {', '.join(dup[:5])}"
+                 f"{' ...' if len(dup) > 5 else ''}. Make every FASTA header unique.")
+    return ids
+
+
+def _shorten_contig_ids(cfg, src):
+    """Prokka refuses contig IDs longer than 37 characters. Write a copy of
+    ``src`` with short IDs and a map back to the originals."""
+    mapping = {}
+    out = cfg.prokka_dir / "input.short_ids.fna"
+    with _open_maybe_gzip(src) as fh, open(out, "w") as fo:
+        for k, rec in enumerate(SeqIO.parse(fh, "fasta"), 1):
+            short = f"contig_{k:06d}"
+            mapping[short] = rec.id
+            fo.write(f">{short}\n{str(rec.seq)}\n")
+    with open(cfg.prokka_dir / "contig_id_map.tsv", "w") as fo:
+        fo.write("prokka_id\toriginal_id\n")
+        for short, orig in mapping.items():
+            fo.write(f"{short}\t{orig}\n")
+    return out, mapping
+
+
+def _restore_contig_ids(cfg, mapping):
+    """Rewrite Prokka's GFF (column 1, ##sequence-region, embedded FASTA) and
+    FNA headers from the short IDs back to the original contig IDs, so every
+    ProFinder output carries the user's contig names."""
+    out, in_fasta = [], False
+    for line in cfg.gff_file.read_text().splitlines(keepends=True):
+        if line.startswith("##FASTA"):
+            in_fasta = True
+        elif in_fasta:
+            if line.startswith(">"):
+                sid = line[1:].split()[0]
+                line = f">{mapping.get(sid, sid)}\n"
+        elif line.startswith("##sequence-region"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] in mapping:
+                parts[1] = mapping[parts[1]]
+                line = " ".join(parts) + "\n"
+        elif not line.startswith("#"):
+            cols = line.split("\t", 1)
+            if len(cols) == 2 and cols[0] in mapping:
+                line = mapping[cols[0]] + "\t" + cols[1]
+        out.append(line)
+    cfg.gff_file.write_text("".join(out))
+    if cfg.fna_file.exists():
+        fna = []
+        for line in cfg.fna_file.read_text().splitlines(keepends=True):
+            if line.startswith(">"):
+                sid = line[1:].split()[0]
+                line = f">{mapping.get(sid, sid)}\n"
+            fna.append(line)
+        cfg.fna_file.write_text("".join(fna))
 
 
 # =====================================================================
@@ -289,36 +422,33 @@ def step01_run_prokka(cfg: Config, force: bool = False):
 
     print("── Running Prokka ──")
     cfg.prokka_dir.mkdir(parents=True, exist_ok=True)
+    ids = _validate_genome_fasta(cfg.input_fasta)
+    _check_prokka(cfg)
 
-    parts = []
-    if cfg.conda_env_prokka:
-        parts.append(
-            f'eval "$(conda shell.bash hook 2>/dev/null)"; '
-            f"conda activate {cfg.conda_env_prokka}; "
-        )
-    
     input_for_prokka = cfg.input_fasta
-
-    if str(cfg.input_fasta).endswith(".gz"):
+    mapping = None
+    long_ids = [i for i in ids if len(i) > _PROKKA_MAX_CONTIG_ID]
+    if long_ids:
+        input_for_prokka, mapping = _shorten_contig_ids(cfg, cfg.input_fasta)
+        print(f"  NOTE: {len(long_ids)} contig ID(s) exceed Prokka's {_PROKKA_MAX_CONTIG_ID}-character "
+              f"limit (e.g. {long_ids[0][:60]}). Prokka runs on short IDs; the original IDs are "
+              f"restored in prokka/{cfg.gff_file.name} and prokka/{cfg.fna_file.name} "
+              f"(map: prokka/contig_id_map.tsv).")
+    elif str(cfg.input_fasta).endswith(".gz"):
         input_for_prokka = cfg.output_dir / f"{cfg.input_fasta.stem}.decompressed.fna"
         with gzip.open(cfg.input_fasta, "rt") as fin, open(input_for_prokka, "w") as fout:
             fout.write(fin.read())
 
-    parts.append(
-        f"{cfg.prokka_bin}"
-        f" --outdir {cfg.prokka_dir}"
-        f" --prefix {cfg.prokka_prefix}"
-        f" --kingdom {cfg.prokka_kingdom}"
-        f" --cpus {cfg.threads}"
-        f" --rfam"
-        f" --force"
-        f" {input_for_prokka}"
-    )
-    cmd = "set -euo pipefail; " + "".join(parts)
-    result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+    q = shlex.quote
+    result = _run_tool(cfg.conda_env_prokka,
+                       f"{cfg.prokka_bin} --outdir {q(str(cfg.prokka_dir))} --prefix {q(cfg.prokka_prefix)}"
+                       f" --kingdom {q(cfg.prokka_kingdom)} --cpus {cfg.threads} --rfam --force"
+                       f" {q(str(input_for_prokka))}")
     if result.returncode != 0:
         print(f"  STDERR: {result.stderr[-500:]}")
         sys.exit(f"Prokka failed with return code {result.returncode}")
+    if mapping:
+        _restore_contig_ids(cfg, mapping)
 
     print(f"  GFF -> {cfg.gff_file}")
     print(f"  FAA -> {cfg.faa_file}")
@@ -332,6 +462,7 @@ def step02_extract_igrs(cfg: Config, force: bool = False):
         print("  Step 2 complete.\n")
         return
 
+    _require(2, (cfg.gff_file, 1))
     print("── Extracting intergenic regions ──")
     cfg.igr_dir.mkdir(parents=True, exist_ok=True)
     fasta_source = cfg.input_fasta
@@ -376,6 +507,8 @@ def step02_extract_igrs(cfg: Config, force: bool = False):
             axis=1,
         )
 
+    if igr_df.empty:
+        igr_df = pd.DataFrame(columns=_IGR_COLUMNS)     # header-only: later steps can read it
     igr_df.to_csv(cfg.igr_summary, sep="\t", index=False)
     print(f"  IGR summary ({len(igr_df)} regions) -> {cfg.igr_summary}")
 
@@ -396,11 +529,12 @@ def step03_identify_operons(cfg: Config, force: bool = False):
         print("  Step 3 complete.\n")
         return
 
+    _require(3, (cfg.gff_file, 1))
     print("── Identifying operons ──")
     genes_df = _parse_gff_for_operons(str(cfg.gff_file))
     if genes_df.empty:
         print("  WARNING: no CDS features found in GFF")
-        pd.DataFrame().to_csv(cfg.operon_file, sep="\t", index=False)
+        pd.DataFrame(columns=_OPERON_COLUMNS).to_csv(cfg.operon_file, sep="\t", index=False)
         print("  Step 3 complete.\n")
         return
 
@@ -435,7 +569,7 @@ def step03_identify_operons(cfg: Config, force: bool = False):
                 "FirstGene": label,
             })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=_OPERON_COLUMNS)
     df.to_csv(cfg.operon_file, sep="\t", index=False)
     print(f"  Operons ({len(operons)} operons, {len(df)} gene rows) -> {cfg.operon_file}")
     print("  Step 3 complete.\n")
@@ -443,18 +577,16 @@ def step03_identify_operons(cfg: Config, force: bool = False):
 
 def step04_run_hmmsearch(cfg: Config, force: bool = False):
     """Run hmmsearch for every individual .hmm profile in the profiles directory."""
+    # Without the marker search there is no marker set: stop rather than
+    # letting later steps fall back to labelling every operon a "marker".
     if cfg.hmm_profiles_dir is None or not cfg.hmm_profiles_dir.is_dir():
-        print("── HMM profiles directory not available ──")
-        print(f"  hmm_profiles_dir: {cfg.hmm_profiles_dir}")
-        print("  Provide --hmm-dir or reinstall to restore bundled profiles.")
-        print("  Step 4 complete.\n")
-        return
+        sys.exit(f"HMM profile directory not available ({cfg.hmm_profiles_dir}). Reinstall "
+                 f"ProFinder to restore the bundled marker profiles, or pass --hmm-dir.")
 
     hmm_files = sorted(cfg.hmm_profiles_dir.glob("*.hmm"))
     if not hmm_files:
-        print(f"── No .hmm files found in {cfg.hmm_profiles_dir} ──")
-        print("  Step 4 complete.\n")
-        return
+        sys.exit(f"No .hmm profiles found in {cfg.hmm_profiles_dir}; pass --hmm-dir with the "
+                 f"marker profiles.")
 
     print(f"  Using {len(hmm_files)} HMM profiles from: {cfg.hmm_profiles_dir}")
 
@@ -469,42 +601,55 @@ def step04_run_hmmsearch(cfg: Config, force: bool = False):
         print("  Step 4 complete.\n")
         return
 
+    _require(4, (cfg.faa_file, 1))
     print(f"── Running hmmsearch ({len(hmm_files)} profiles) ──")
     cfg.hmm_dir.mkdir(parents=True, exist_ok=True)
 
-    failed = 0
+    # Fail once, clearly, when hmmsearch itself is unavailable.
+    probe = _run_tool(cfg.conda_env_hmm, f"{cfg.hmmsearch_bin} -h")
+    if probe.returncode != 0:
+        where = f" in conda env {cfg.conda_env_hmm}" if cfg.conda_env_hmm else ""
+        sys.exit(f"hmmsearch is not runnable as '{cfg.hmmsearch_bin}'{where}: "
+                 f"{(probe.stdout + probe.stderr).strip()[-300:] or 'no output'}\n"
+                 f"Install HMMER (conda install -c conda-forge -c bioconda hmmer) or pass "
+                 f"--hmmsearch / --conda-hmm.")
+    with open(cfg.faa_file) as fh:
+        n_proteins = sum(1 for line in fh if line.startswith(">"))
+
+    q = shlex.quote
+    failed = []
     for i, hmm_path in enumerate(hmm_files, 1):
         out_file = tblout_dir / (hmm_path.stem + ".tblout")
         log_file = tblout_dir / (hmm_path.stem + ".log")
+        part = out_file.with_name(out_file.name + ".part")
 
         if not force and out_file.exists():
             continue
 
-        parts = []
-        if cfg.conda_env_hmm:
-            parts.append(
-                f'eval "$(conda shell.bash hook 2>/dev/null)"; '
-                f"conda activate {cfg.conda_env_hmm}; "
-            )
-        parts.append(
-            f"{cfg.hmmsearch_bin}"
-            f" --tblout {out_file}"
-            f" -o {log_file}"
-            f" --noali --cpu {cfg.threads}"
-            f" {hmm_path} {cfg.faa_file}"
-        )
-        cmd = "set -euo pipefail; " + "".join(parts)
-        result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+        if n_proteins == 0:
+            # No proteins predicted: record an empty, completed search.
+            part.write_text("# no proteins predicted in this genome\n# [ok]\n")
+            os.replace(part, out_file)
+            continue
+        # Write to a .part file and rename only on success, so an interrupted
+        # or failed search never looks complete to the checkpoint test.
+        result = _run_tool(cfg.conda_env_hmm,
+                           f"{cfg.hmmsearch_bin} --tblout {q(str(part))} -o {q(str(log_file))}"
+                           f" --noali --cpu {cfg.threads} {q(str(hmm_path))} {q(str(cfg.faa_file))}")
         if result.returncode != 0:
-            print(f"  WARNING: hmmsearch failed for {hmm_path.name}: "
-                  f"{result.stderr[-200:]}")
-            failed += 1
+            part.unlink(missing_ok=True)
+            failed.append((hmm_path.name, (result.stderr or result.stdout).strip()[-200:]))
+            print(f"  WARNING: hmmsearch failed for {hmm_path.name}: {failed[-1][1]}")
+        else:
+            os.replace(part, out_file)
 
         if i % 100 == 0 or i == len(hmm_files):
             print(f"  {i}/{len(hmm_files)} profiles searched...")
 
     if failed:
-        print(f"  {failed} profile(s) failed during hmmsearch.")
+        sys.exit(f"hmmsearch failed for {len(failed)} of {len(hmm_files)} profiles (first: "
+                 f"{failed[0][0]}: {failed[0][1] or 'no message'}). Per-profile logs are in "
+                 f"{tblout_dir}/. Re-running the same command retries only the failed profiles.")
 
     print("  Step 4 complete.\n")
 
@@ -520,9 +665,8 @@ def step05_filter_hmm(cfg: Config, force: bool = False):
     tblout_files = sorted(tblout_dir.glob("*.tblout")) if tblout_dir.is_dir() else []
 
     if not tblout_files:
-        print("── No HMM output to filter, skipping ──")
-        print("  Step 5 complete.\n")
-        return
+        sys.exit(f"Step 5 cannot run: no hmmsearch output in {tblout_dir} (written by step 4). "
+                 f"Run step 4 first (e.g. --start 4).")
 
     print(f"── Filtering HMM output ({len(tblout_files)} tblout files) ──")
     all_rows = []
@@ -557,8 +701,12 @@ def step06_filter_operons_add_markers(cfg: Config, force: bool = False):
         print("  Step 6 complete.\n")
         return
 
+    _require(6, (cfg.operon_file, 3), (cfg.hmm_filtered, 5))
     print("── Filtering operons ──")
-    df = pd.read_csv(cfg.operon_file, sep="\t")
+    try:
+        df = pd.read_csv(cfg.operon_file, sep="\t")
+    except pd.errors.EmptyDataError:                # header-less file from an older run
+        df = pd.DataFrame(columns=_OPERON_COLUMNS)
     if df.empty:
         print("  No operons to filter.")
         df.to_csv(cfg.operon_filtered_markers, sep="\t", index=False)
@@ -621,11 +769,9 @@ def step06_filter_operons_add_markers(cfg: Config, force: bool = False):
                 print("    Check that both files come from the same "
                       "annotation run.")
     else:
-        # No HMM data: use all filtered operons as-is
-        print("  No HMM data available; using all filtered operons as markers")
-        filtered["target_name"] = filtered["Gene"]
-        filtered["accession2"] = "no_hmm"
-        filtered.to_csv(cfg.operon_filtered_markers, sep="\t", index=False)
+        # An empty hmm_filtered.tsv means step 5 was interrupted. Never fall
+        # back to treating every operon as a marker operon.
+        sys.exit(f"{cfg.hmm_filtered} is empty - re-run step 5 (e.g. --start 5 --force).")
 
     print("  Step 6 complete.\n")
 
@@ -637,8 +783,12 @@ def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
         print("  Step 7 complete.\n")
         return
 
+    _require(7, (cfg.igr_summary, 2), (cfg.operon_filtered_markers, 6), (cfg.hmm_filtered, 5))
     print("── Matching IGRs to marker operons ──")
-    igr = pd.read_csv(cfg.igr_summary, sep="\t")
+    try:
+        igr = pd.read_csv(cfg.igr_summary, sep="\t")
+    except pd.errors.EmptyDataError:                # header-less file from an older run
+        igr = pd.DataFrame(columns=_IGR_COLUMNS)
     try:
         markers = pd.read_csv(cfg.operon_filtered_markers, sep="\t")
     except (FileNotFoundError, pd.errors.EmptyDataError):
@@ -674,10 +824,8 @@ def step07_match_igrs_to_markers(cfg: Config, force: bool = False):
 
     # Build expanded variant with one row per IGR × HMM profile match.
     # Determine which gene column is the marker gene for each matched IGR.
-    matched["marker_gene"] = matched.apply(
-        lambda r: r["right_gene"] if r["marker_match"] == "CO_F" else r["left_gene"],
-        axis=1,
-    )
+    matched["marker_gene"] = np.where(matched["marker_match"] == "CO_F",
+                                      matched["right_gene"], matched["left_gene"])
 
     # Load HMM filtered hits for the profile names
     hmm_profiles = pd.DataFrame()
@@ -816,15 +964,14 @@ def step08_scan_motifs(cfg: Config, force: bool = False):
         print("  Step 8 complete.\n")
         return
 
+    _require(8, (cfg.igr_summary, 2), (cfg.promoter_markers, 7))
     meme_file = cfg.meme_file
     if meme_file is None or not Path(meme_file).is_file():
         bundled = Path(__file__).parent / "all_unique_subgroups.meme"
         meme_file = bundled if bundled.is_file() else None
     if meme_file is None:
-        print("── No MEME file found, skipping motif scan ──")
-        pd.DataFrame().to_csv(cfg.promoter_markers_verified, sep="\t", index=False)
-        print("  Step 8 complete.\n")
-        return
+        sys.exit("Motif file not found: reinstall ProFinder to restore the bundled "
+                 "all_unique_subgroups.meme, or pass --meme-file.")
 
     bg_source = cfg.fna_file if cfg.fna_file.exists() else cfg.input_fasta
     bg = _compute_background_from_fasta(bg_source)
@@ -1172,8 +1319,9 @@ def diagnose_p_sweep(cfg: Config, sweep_min=1e-5, sweep_max=1e-1,
         if bundled.is_file():
             meme_file = bundled
         else:
-            print("── No MEME file found, skipping p-sweep diagnostic ──")
-            return
+            sys.exit("Motif file not found: reinstall ProFinder to restore the bundled "
+                     "all_unique_subgroups.meme, or pass --meme-file.")
+    _require("p-sweep", (cfg.igr_summary, 2), (cfg.promoter_markers, 7))
 
     try:
         all_igr = pd.read_csv(cfg.igr_summary, sep="\t")
@@ -1359,6 +1507,7 @@ def step09_annotate_cds(cfg: Config, force: bool = False):
         print("  Step 9 complete.\n")
         return
 
+    _require(9, (cfg.igr_summary, 2), (cfg.gff_file, 1))
     # Collect CDS gene IDs from ALL promoter-orientation IGRs.
     # For CO_F the associated CDS is right_gene; for CO_R it's left_gene.
     gene_ids = set()
@@ -1483,6 +1632,7 @@ def step11_generate_report(cfg: Config, force: bool = False):
         print("  Step 11 complete.\n")
         return
 
+    _require(11, (cfg.igr_summary, 2), (cfg.promoter_markers_verified, 8), (cfg.cds_annotations, 9))
     print("── Generating HTML report ──")
 
     # Only motif-verified marker promoters (step 8) are reported. The
@@ -2020,6 +2170,8 @@ def step10_final_table(cfg: Config, force: bool = False):
         print("  Step 10 complete.\n")
         return
 
+    _require(10, (cfg.igr_summary, 2), (cfg.promoter_markers, 7),
+             (cfg.motif_best_all, 8), (cfg.cds_annotations, 9))
     print("── Building final output table ──")
 
     # 1. Start from ALL promoter-orientation IGRs
@@ -2287,6 +2439,23 @@ def main():
         for num, name, _ in STEPS:
             print(f"  {num:2d}. {name}")
         sys.exit(0)
+
+    last = max(num for num, _, _ in STEPS)
+    if not 1 <= args.start <= args.end <= last:
+        parser.error(f"--start/--end must satisfy 1 <= start <= end <= {last}")
+    if args.threads < 1:
+        parser.error("--threads must be >= 1")
+    if args.n_shuffles < 1:
+        parser.error("--n-shuffles must be >= 1 (the empirical null needs at least one shuffle)")
+    for flag, val in (("--p10", args.p10), ("--p35", args.p35), ("--p35-relaxed", args.p35_relaxed)):
+        if not 0.0 < val < 1.0:
+            parser.error(f"{flag} must lie strictly between 0 and 1 (got {val})")
+    if args.prior is not None and not 0.0 < args.prior < 1.0:
+        parser.error(f"--prior must lie strictly between 0 and 1 (got {args.prior})")
+    if args.igr_min < 1 or args.igr_min > args.igr_max:
+        parser.error("--igr-min must be >= 1 and <= --igr-max")
+    if args.cds_bp < 0 or args.max_dist_to_cds_start < 0:
+        parser.error("--cds-bp and --max-dist-to-cds-start must be >= 0")
 
     # One of --input / --batch is required for any real run. We enforce
     # this here (rather than via argparse `required=`) so --list can run
